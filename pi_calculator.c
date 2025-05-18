@@ -474,9 +474,26 @@ struct disk_int {
 
 // Get chunk file path from base path and chunk index
 int get_chunk_path(char *dest, size_t dest_size, const char *base_path, size_t chunk_idx) {
-    char component[32];
-    snprintf(component, sizeof(component), "chunk_%zu.bin", chunk_idx);
-    return safe_path_join(dest, dest_size, base_path, component);
+    // Check if the base_path itself contains a file name pattern (int_X_Y)
+    const char *base_name = strrchr(base_path, '/');
+    if (base_name) {
+        base_name++; // Skip the slash
+    } else {
+        base_name = base_path;
+    }
+    
+    // Determine if we're using the old or new format
+    if (strstr(base_name, "int_") != NULL) {
+        // Using the directory-based format (int_PID_ID)
+        char component[32];
+        snprintf(component, sizeof(component), "%zu.bin", chunk_idx);
+        return safe_path_join(dest, dest_size, base_path, component);
+    } else {
+        // Using the old chunk-based format
+        char component[32];
+        snprintf(component, sizeof(component), "chunk_%zu.bin", chunk_idx);
+        return safe_path_join(dest, dest_size, base_path, component);
+    }
 }
 
 // Determine optimal chunk size based on available memory and total size
@@ -564,14 +581,17 @@ int load_chunk(disk_int* d_int, size_t chunk_idx) {
     return 0;
 }
 
-// Save a specific chunk to disk
+// Save a specific chunk to disk with improved error handling
 int save_chunk(disk_int* d_int, size_t chunk_idx) {
     if (chunk_idx >= d_int->num_chunks) {
+        fprintf(stderr, "Error: Invalid chunk index %zu (max is %zu)\n", chunk_idx, d_int->num_chunks - 1);
         return -1; // Invalid chunk index
     }
     
     // If this chunk is not currently cached, we can't save it
     if (!d_int->cache || d_int->cache_chunk_idx != chunk_idx) {
+        fprintf(stderr, "Error: Cannot save uncached chunk %zu (cache chunk is %zu)\n", 
+                chunk_idx, d_int->cache_chunk_idx);
         return -1;
     }
     
@@ -592,8 +612,12 @@ int save_chunk(disk_int* d_int, size_t chunk_idx) {
     // Construct chunk file path
     char chunk_path[MAX_PATH];
     if (get_chunk_path(chunk_path, MAX_PATH, d_int->file_path, chunk_idx) < 0) {
+        fprintf(stderr, "Error: Failed to construct path for chunk %zu from base %s\n", 
+                chunk_idx, d_int->file_path);
         return -1;
     }
+    
+    printf("DEBUG: Saving chunk to: %s\n", chunk_path);
     
     // Ensure directory exists
     char dir_path[MAX_PATH];
@@ -603,28 +627,61 @@ int save_chunk(disk_int* d_int, size_t chunk_idx) {
         strncpy(dir_path, chunk_path, dir_len);
         dir_path[dir_len] = '\0';
         
+        printf("DEBUG: Creating directory: %s\n", dir_path);
         if (mkdir_recursive(dir_path, 0755) != 0) {
-            unified_log(LOG_LEVEL_ERROR, "Error creating directory structure for: %s", chunk_path);
+            fprintf(stderr, "Error creating directory structure for: %s (errno: %d - %s)\n", 
+                    dir_path, errno, strerror(errno));
             return -1;
         }
     }
     
-    // Open chunk file for writing
+    // Open chunk file for writing with proper error checking
     FILE* f = fopen(chunk_path, "wb");
     if (!f) {
-        unified_log(LOG_LEVEL_ERROR, "Error opening chunk file for writing: %s", chunk_path);
+        fprintf(stderr, "Error opening chunk file for writing: %s (errno: %d - %s)\n", 
+                chunk_path, errno, strerror(errno));
         return -1;
     }
     
-    // Write chunk data
-    size_t written = fwrite(d_int->cache, sizeof(mp_limb_t), chunk_size, f);
-    fclose(f);
+    // Write chunk data - make sure we're writing something valid
+    if (chunk_size == 0 || !d_int->cache) {
+        fprintf(stderr, "Warning: Attempt to write empty chunk (size=%zu, cache=%p)\n",
+                chunk_size, (void*)d_int->cache);
+        // Write at least one byte to create a non-empty file
+        fputc(0, f);
+    } else {
+        size_t written = fwrite(d_int->cache, sizeof(mp_limb_t), chunk_size, f);
+        if (written != chunk_size) {
+            fprintf(stderr, "Error writing chunk data: wrote %zu of %zu items (errno: %d - %s)\n", 
+                   written, chunk_size, errno, strerror(errno));
+            fclose(f);
+            return -1;
+        }
+    }
     
-    if (written != chunk_size) {
-        unified_log(LOG_LEVEL_ERROR, "Error writing chunk data to file: %s", chunk_path);
+    // Flush and close file
+    fflush(f);
+    if (fclose(f) != 0) {
+        fprintf(stderr, "Error closing chunk file: %s (errno: %d - %s)\n",
+                chunk_path, errno, strerror(errno));
         return -1;
     }
     
+    // Verify file was written correctly
+    struct stat st;
+    if (stat(chunk_path, &st) == 0) {
+        if (st.st_size == 0) {
+            fprintf(stderr, "Warning: Created empty chunk file: %s\n", chunk_path);
+        } else {
+            printf("DEBUG: Successfully wrote %lld bytes to %s\n", 
+                   (long long)st.st_size, chunk_path);
+        }
+    } else {
+        fprintf(stderr, "Warning: Could not verify chunk file: %s (errno: %d - %s)\n",
+                chunk_path, errno, strerror(errno));
+    }
+    
+    // Mark as clean
     d_int->dirty = false;
     return 0;
 }
@@ -720,13 +777,14 @@ int mkdir_recursive(const char* path, mode_t mode) {
 // Initialize a disk integer
 void disk_int_init(disk_int* d_int, const char* base_path) {
     printf("DEBUG: disk_int_init with base_path=%s\n", base_path ? base_path : "NULL");
+    
     // Safety check
     if (!d_int) {
         fprintf(stderr, "Error: NULL disk_int pointer in disk_int_init\n");
         return;
     }
     
-    // First, ensure the structure is cleared
+    // First, ensure the structure is zeroed out
     memset(d_int, 0, sizeof(disk_int));
     
     // Make sure base_path is valid
@@ -737,25 +795,27 @@ void disk_int_init(disk_int* d_int, const char* base_path) {
         return;
     }
     
-    // Initialize the mutex (only need to do this once)
-    pthread_mutex_init(&d_int->lock, NULL);
-    
-    // Store the base path for this disk integer
-    // We'll create a unique directory for this disk integer's chunks
+    // Create a unique directory name for this disk integer
     static int counter = 0;
     snprintf(d_int->file_path, MAX_PATH, "%s/int_%d_%lu", 
              base_path, (int)getpid(), (unsigned long)counter++);
     printf("DEBUG: Generated base path: %s\n", d_int->file_path);
     
-    // Create directory structure for this disk integer
+    // Create directory structure first
     if (mkdir_recursive(d_int->file_path, 0755) != 0) {
         fprintf(stderr, "Error creating directory structure for: %s\n", d_int->file_path);
-        pthread_mutex_destroy(&d_int->lock);  // Clean up mutex if directory creation fails
         d_int->file_path[0] = '\0';
         return;
     }
     
-    // Initialize chunking parameters
+    // Initialize mutex for thread safety
+    if (pthread_mutex_init(&d_int->lock, NULL) != 0) {
+        fprintf(stderr, "Error initializing mutex for disk integer\n");
+        d_int->file_path[0] = '\0';
+        return;
+    }
+    
+    // Initialize the rest of the structure
     d_int->total_size_in_limbs = 0;
     d_int->sign = 0;
     d_int->chunk_size = determine_optimal_chunk_size(DEFAULT_MEMORY_LIMIT, 0);
@@ -764,6 +824,7 @@ void disk_int_init(disk_int* d_int, const char* base_path) {
     d_int->cache_chunk_idx = 0;
     d_int->dirty = false;
     
+    // Debug output
     printf("DEBUG: Initialized chunked disk_int with optimal chunk size = %zu limbs\n", 
            d_int->chunk_size);
 }
@@ -2233,30 +2294,85 @@ struct chudnovsky_state {
 
 // Initialize Chudnovsky state
 void chudnovsky_state_init(chudnovsky_state* state, const char* base_path) {
+    if (!state) {
+        fprintf(stderr, "Error: Null state passed to chudnovsky_state_init\n");
+        return;
+    }
+    
+    // Initialize all fields to a known state
+    memset(state, 0, sizeof(chudnovsky_state));
+    
     printf("DEBUG: chudnovsky_state_init with base_path=%s\n", base_path ? base_path : "NULL");
+    
+    if (!base_path || base_path[0] == '\0') {
+        fprintf(stderr, "Error: Invalid base path for Chudnovsky state\n");
+        return;
+    }
+    
+    // Create the directories
+    if (mkdir_recursive(base_path, 0755) != 0) {
+        fprintf(stderr, "Error: Failed to create base directory for Chudnovsky state: %s\n", base_path);
+        return;
+    }
+    
     char p_path[MAX_PATH], q_path[MAX_PATH], t_path[MAX_PATH];
     
-    printf("DEBUG: Joining %s with P\n", base_path ? base_path : "NULL");
+    printf("DEBUG: Joining %s with P\n", base_path);
     if (safe_path_join(p_path, MAX_PATH, base_path, "P") < 0) {
         fprintf(stderr, "Error: Path too long for Chudnovsky state P\n");
-        // Since this is initialization, it's serious enough to exit or handle specially
-        exit(1);
+        return;
     }
-    printf("DEBUG: Joining %s with Q\n", base_path ? base_path : "NULL");
+    
+    if (mkdir_recursive(p_path, 0755) != 0) {
+        fprintf(stderr, "Error: Failed to create P directory: %s\n", p_path);
+        return;
+    }
+    
+    printf("DEBUG: Joining %s with Q\n", base_path);
     if (safe_path_join(q_path, MAX_PATH, base_path, "Q") < 0) {
         fprintf(stderr, "Error: Path too long for Chudnovsky state Q\n");
-        exit(1);
+        return;
     }
-    printf("DEBUG: Joining %s with T\n", base_path ? base_path : "NULL");
+    
+    if (mkdir_recursive(q_path, 0755) != 0) {
+        fprintf(stderr, "Error: Failed to create Q directory: %s\n", q_path);
+        return;
+    }
+    
+    printf("DEBUG: Joining %s with T\n", base_path);
     if (safe_path_join(t_path, MAX_PATH, base_path, "T") < 0) {
         fprintf(stderr, "Error: Path too long for Chudnovsky state T\n");
-        exit(1);
+        return;
+    }
+    
+    if (mkdir_recursive(t_path, 0755) != 0) {
+        fprintf(stderr, "Error: Failed to create T directory: %s\n", t_path);
+        return;
     }
     
     printf("DEBUG: Paths: P=%s, Q=%s, T=%s\n", p_path, q_path, t_path);
+    
+    // Initialize disk integers
     disk_int_init(&state->P, p_path);
+    if (state->P.file_path[0] == '\0') {
+        fprintf(stderr, "Error: Failed to initialize disk integer P\n");
+        return;
+    }
+    
     disk_int_init(&state->Q, q_path);
+    if (state->Q.file_path[0] == '\0') {
+        fprintf(stderr, "Error: Failed to initialize disk integer Q\n");
+        disk_int_clear(&state->P);
+        return;
+    }
+    
     disk_int_init(&state->T, t_path);
+    if (state->T.file_path[0] == '\0') {
+        fprintf(stderr, "Error: Failed to initialize disk integer T\n");
+        disk_int_clear(&state->P);
+        disk_int_clear(&state->Q);
+        return;
+    }
 }
 
 // Clear Chudnovsky state
