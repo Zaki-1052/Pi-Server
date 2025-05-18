@@ -57,6 +57,15 @@
 #define MAX_CALC_QUEUE_SIZE 1024           // Maximum calculation task queue size
 #define DEFAULT_MEMORY_LIMIT (20UL * 1024 * 1024 * 1024) // 20GB default limit
 #define MIN_CHUNK_SIZE (1024*1024)         // Minimum chunk size of 1MB
+
+// Define MIN and MAX macros
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
+#ifndef MAX
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#endif
 #define MAX_CHUNK_SIZE (512*1024*1024)     // Maximum chunk size of 512MB
 #define MAX_JOBS 100                       // Maximum concurrent calculation jobs
 #define MAX_JOB_AGE_SECONDS 86400          // Maximum age of completed jobs (1 day)
@@ -188,10 +197,22 @@ typedef enum {
     LOG_OUTPUT_FILE
 } log_output_t;
 
-// Flag to indicate a segmentation fault has occurred
-volatile sig_atomic_t g_segfault_occurred = 0;
-// Path where crash log should be written
-char g_crash_log_path[MAX_PATH];
+// Global variables
+volatile sig_atomic_t g_segfault_occurred = 0; // Flag to indicate a segmentation fault
+char g_crash_log_path[MAX_PATH]; // Path where crash log should be written
+
+// Forward declarations of structs
+typedef struct disk_int disk_int;
+typedef struct calc_thread_pool calc_thread_pool;
+
+// Global variables (after typedefs)
+extern calc_thread_pool* g_calc_pool;
+
+// Function prototypes
+int safe_path_join(char* dest, size_t dest_size, const char* base_path, const char* component);
+int save_chunk(disk_int* d_int, size_t chunk_idx);
+int mkdir_recursive(const char* path, mode_t mode);
+int convert_log_level_string_to_int(const char* level_str);
 
 // Async-signal safe handler for segmentation faults
 void segfault_handler(int sig) {
@@ -1801,7 +1822,7 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
     bool temp1_initialized = false;
     bool temp2_initialized = false;
     
-    if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+    if (config.logging.level <= LOG_LEVEL_DEBUG) {
         printf("DEBUG: binary_split_disk a=%lu, b=%lu, base_path=%s\n", a, b, base_path ? base_path : "NULL");
     }
     
@@ -1838,12 +1859,12 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
     }
     
     // If range is small enough, compute in memory then save to disk
-    if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+    if (config.logging.level <= LOG_LEVEL_DEBUG) {
         printf("DEBUG: Range check b-a=%lu, threshold=%zu\n", b-a, memory_threshold);
     }
     
     if (b - a <= memory_threshold) {
-        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Computing in memory\n");
         }
         
@@ -1855,7 +1876,7 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
         binary_split_mpz(P, Q, T, a, b);
         
         // Debug output for small ranges
-        if (b - a < 5 && config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (b - a < 5 && config.logging.level <= LOG_LEVEL_DEBUG) {
             char *p_str = mpz_get_str(NULL, 10, P);
             char *q_str = mpz_get_str(NULL, 10, Q);
             char *t_str = mpz_get_str(NULL, 10, T);
@@ -1877,19 +1898,19 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
     } else {
         // Split the range
         unsigned long m = (a + b) / 2;
-        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Splitting range at m=%lu\n", m);
         }
         
         // Create paths for left and right results
         snprintf(left_path, MAX_PATH, "%s/left", base_path);
         snprintf(right_path, MAX_PATH, "%s/right", base_path);
-        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: left_path=%s, right_path=%s\n", left_path, right_path);
         }
         
         // Create directories with error checking
-        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Creating directory: %s\n", left_path);
         }
         
@@ -1901,7 +1922,7 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
             goto cleanup;
         }
         
-        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Creating directory: %s\n", right_path);
         }
         
@@ -1915,27 +1936,27 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
         
         // Compute left and right halves
         chudnovsky_state left_state, right_state;
-        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Initializing left_state with path: %s\n", left_path);
         }
         
         chudnovsky_state_init(&left_state, left_path);
         left_state_initialized = true;
         
-        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Initializing right_state with path: %s\n", right_path);
         }
         
         chudnovsky_state_init(&right_state, right_path);
         right_state_initialized = true;
         
-        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Recursively calling binary_split_disk for left half\n");
         }
         
         binary_split_disk(&left_state, a, m, left_path, memory_threshold);
         
-        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Recursively calling binary_split_disk for right half\n");
         }
         
@@ -1944,11 +1965,11 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
         // Create temp paths
         snprintf(temp1_path, MAX_PATH, "%s/temp1", base_path);
         snprintf(temp2_path, MAX_PATH, "%s/temp2", base_path);
-        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: temp1_path=%s, temp2_path=%s\n", temp1_path, temp2_path);
         }
         
-        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Creating directory: %s\n", temp1_path);
         }
         
@@ -1960,7 +1981,7 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
             goto cleanup;
         }
         
-        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Creating directory: %s\n", temp2_path);
         }
         
@@ -2429,7 +2450,7 @@ void http_enqueue_job(int client_sock) {
     
     // Check if the queue is full, wait if necessary
     while ((http_queue_back + 1) % MAX_HTTP_QUEUE_SIZE == http_queue_front) {
-        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.level <= LOG_LEVEL_DEBUG) {
             fprintf(stderr, "Debug: HTTP job queue is full, waiting for space\n");
         }
         pthread_cond_wait(&http_queue_not_full, &http_queue_lock);
@@ -2451,7 +2472,7 @@ void http_enqueue_job(int client_sock) {
     pthread_cond_signal(&http_queue_not_empty);
     
     // Log the queue operation
-    if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+    if (config.logging.level <= LOG_LEVEL_DEBUG) {
         fprintf(stderr, "Debug: Enqueued socket %d, queue size now %d\n", 
                 client_sock, http_queue_size());
     }
@@ -2465,7 +2486,7 @@ int http_dequeue_job() {
     
     // Check if the queue is empty, wait if necessary
     while (http_queue_front == http_queue_back) {
-        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.level <= LOG_LEVEL_DEBUG) {
             fprintf(stderr, "Debug: HTTP job queue is empty, waiting for job\n");
         }
         pthread_cond_wait(&http_queue_not_empty, &http_queue_lock);
@@ -2493,7 +2514,7 @@ int http_dequeue_job() {
     pthread_cond_signal(&http_queue_not_full);
     
     // Log the queue operation
-    if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+    if (config.logging.level <= LOG_LEVEL_DEBUG) {
         fprintf(stderr, "Debug: Dequeued socket %d, queue size now %d\n", 
                 client_sock, http_queue_size());
     }
@@ -3591,7 +3612,7 @@ void set_default_config() {
     // Logging settings
     strncpy(config.logging_level, "info", sizeof(config.logging_level));
     strncpy(config.logging_output, "console", sizeof(config.logging_output));
-    config.logging.logging.level = LOG_LEVEL_INFO; // Set default integer level
+    config.logging.level = LOG_LEVEL_INFO; // Set default integer level
     
     // Directory settings
     strncpy(config.work_dir, "./pi_calc", sizeof(config.work_dir));
@@ -3688,7 +3709,7 @@ bool load_config_from_file(const char* config_file) {
             if (level) {
                 strncpy(config.logging_level, level, sizeof(config.logging_level));
                 // Also set the integer value
-                config.logging.logging.level = convert_log_level_string_to_int(level);
+                config.logging.level = convert_log_level_string_to_int(level);
             }
         }
         
@@ -3774,7 +3795,7 @@ void override_config_with_args(int argc, char** argv) {
     }
     
     // Make sure the string log level is converted to its integer equivalent
-    config.logging.logging.level = convert_log_level_string_to_int(config.logging_level);
+    config.logging.level = convert_log_level_string_to_int(config.logging_level);
     
     // If non-option arguments exist and in server mode, switch to CLI mode
     if (optind < argc && config.mode == MODE_SERVER) {
@@ -5149,7 +5170,7 @@ void run_server_mode() {
                 // Signal a worker thread that there's a new job
                 sem_post(http_pool.job_semaphore);
                 
-                if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+                if (config.logging.level <= LOG_LEVEL_DEBUG) {
                     char client_ip[INET_ADDRSTRLEN];
                     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
                     fprintf(stderr, "Debug: Accepted connection from %s:%d\n",
