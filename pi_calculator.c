@@ -90,7 +90,9 @@
 // Logging levels
 #define LOG_LEVEL_DEBUG 0
 #define LOG_LEVEL_INFO 1
-#define LOG_LEVEL_ERROR 2
+#define LOG_LEVEL_WARNING 2
+#define LOG_LEVEL_ERROR 3
+#define LOG_LEVEL_CRITICAL 4
 
 // AARCH64 specific
 #define CACHE_LINE_SIZE 64                 // Typical L1 cache line size for AARCH64
@@ -231,12 +233,30 @@ void segfault_handler(int sig) {
     g_crash_log_path[i] = '\0';
     
     // Write a minimal message to stderr using only async-signal safe functions
-    const char *msg = "CRITICAL: Caught segmentation fault. Terminating process.\n";
+    const char *msg = "CRITICAL: Caught segmentation fault. Attempting crash logging via fork()...\n";
     write(STDERR_FILENO, msg, strlen(msg));
     
-    // Use _exit() instead of exit() to avoid calling atexit handlers which might cause another crash
-    // This is async-signal safe
-    _exit(1);
+    // Use fork() to create a separate process for crash logging
+    // This is async-signal safe according to POSIX
+    pid_t pid = fork();
+    
+    if (pid == -1) {
+        // Fork failed, simply exit
+        const char *fork_fail_msg = "CRITICAL: Fork failed for crash logging, exiting.\n";
+        write(STDERR_FILENO, fork_fail_msg, strlen(fork_fail_msg));
+        _exit(1);
+    } 
+    else if (pid == 0) {
+        // Child process - perform crash logging
+        perform_crash_logging(g_crash_log_path);
+        _exit(0);  // Child exits after logging
+    } 
+    else {
+        // Parent process - exit immediately with error code
+        const char *parent_msg = "Parent process exiting. Check crash log for details.\n";
+        write(STDERR_FILENO, parent_msg, strlen(parent_msg));
+        _exit(1);
+    }
 }
 
 // Non-signal function that can be called by a monitoring thread to perform thorough crash logging
@@ -581,7 +601,7 @@ int save_chunk(disk_int* d_int, size_t chunk_idx) {
         dir_path[dir_len] = '\0';
         
         if (mkdir_recursive(dir_path, 0755) != 0) {
-            fprintf(stderr, "Error creating directory structure for: %s\n", chunk_path);
+            unified_log(LOG_LEVEL_ERROR, "Error creating directory structure for: %s", chunk_path);
             return -1;
         }
     }
@@ -589,7 +609,7 @@ int save_chunk(disk_int* d_int, size_t chunk_idx) {
     // Open chunk file for writing
     FILE* f = fopen(chunk_path, "wb");
     if (!f) {
-        fprintf(stderr, "Error opening chunk file for writing: %s\n", chunk_path);
+        unified_log(LOG_LEVEL_ERROR, "Error opening chunk file for writing: %s", chunk_path);
         return -1;
     }
     
@@ -598,7 +618,7 @@ int save_chunk(disk_int* d_int, size_t chunk_idx) {
     fclose(f);
     
     if (written != chunk_size) {
-        fprintf(stderr, "Error writing chunk data to file: %s\n", chunk_path);
+        unified_log(LOG_LEVEL_ERROR, "Error writing chunk data to file: %s", chunk_path);
         return -1;
     }
     
@@ -740,7 +760,7 @@ void disk_int_init(disk_int* d_int, const char* base_path) {
 // Clear and free resources for a disk integer
 void disk_int_clear(disk_int* d_int) {
     // Check if lock is already initialized
-    if (d_int->file_path[0] == '\0') {
+    if (!d_int || d_int->file_path[0] == '\0') {
         // Nothing to clean up - likely already cleared or not initialized
         return;
     }
@@ -758,9 +778,12 @@ void disk_int_clear(disk_int* d_int) {
         d_int->cache = NULL;
     }
     
-    // Save the file path for cleanup after lock release
+    // Save the file path and number of chunks for cleanup after lock release
     char file_path_copy[MAX_PATH];
     strncpy(file_path_copy, d_int->file_path, MAX_PATH);
+    
+    // Store the actual number of chunks before clearing
+    size_t num_chunks = d_int->num_chunks;
     
     // Mark as cleared by emptying the path
     d_int->file_path[0] = '\0';
@@ -775,30 +798,26 @@ void disk_int_clear(disk_int* d_int) {
     pthread_mutex_unlock(&d_int->lock);
     pthread_mutex_destroy(&d_int->lock);
     
-    // Delete all chunk files and directory after lock is released
-    // We need to check each possible chunk file
-    for (size_t i = 0; i < 1000; i++) {  // Upper limit to prevent infinite loop
+    // Delete all chunk files using the stored num_chunks value
+    // This is more efficient and accurate than checking for file existence
+    for (size_t i = 0; i < num_chunks; i++) {
         char chunk_path[MAX_PATH];
-        char chunk_component[32];
-        snprintf(chunk_component, sizeof(chunk_component), "chunk_%zu.bin", i);
-        
-        if (safe_path_join(chunk_path, MAX_PATH, file_path_copy, chunk_component) < 0) {
-            break;
+        if (get_chunk_path(chunk_path, MAX_PATH, file_path_copy, i) < 0) {
+            fprintf(stderr, "Warning: Failed to construct path for chunk %zu\n", i);
+            continue;
         }
         
-        if (access(chunk_path, F_OK) == 0) {
-            if (remove(chunk_path) != 0) {
-                fprintf(stderr, "Warning: Failed to delete chunk file: %s\n", chunk_path);
-            }
-        } else {
-            // If we can't find this chunk, assume there are no more
-            break;
+        if (remove(chunk_path) != 0 && errno != ENOENT) {
+            // Only print warning if error is not "file doesn't exist"
+            fprintf(stderr, "Warning: Failed to delete chunk file: %s (error: %s)\n", 
+                    chunk_path, strerror(errno));
         }
     }
     
     // Finally, remove the directory
-    if (rmdir(file_path_copy) != 0) {
-        fprintf(stderr, "Warning: Failed to delete directory: %s\n", file_path_copy);
+    if (rmdir(file_path_copy) != 0 && errno != ENOENT) {
+        fprintf(stderr, "Warning: Failed to delete directory: %s (error: %s)\n", 
+                file_path_copy, strerror(errno));
     }
 }
 
@@ -997,7 +1016,7 @@ void disk_int_get_mpz(mpz_t mpz_val, disk_int* d_int) {
 // Compare the absolute values of two disk integers
 // Returns: 1 if |a| > |b|, 0 if |a| == |b|, -1 if |a| < |b|
 int disk_int_cmp_abs(disk_int* a, disk_int* b) {
-    // First check if either a or b is zero
+    // First check if either a or b is zero (without locks)
     if (a->total_size_in_limbs == 0 || a->sign == 0) {
         if (b->total_size_in_limbs == 0 || b->sign == 0) {
             return 0; // Both are zero, they're equal
@@ -1009,7 +1028,7 @@ int disk_int_cmp_abs(disk_int* a, disk_int* b) {
         return 1; // b is zero, a is non-zero, so |a| > |b|
     }
     
-    // Compare by total size in limbs first
+    // Compare by total size in limbs first (still no locks needed)
     if (a->total_size_in_limbs > b->total_size_in_limbs) {
         return 1;
     } else if (a->total_size_in_limbs < b->total_size_in_limbs) {
@@ -1019,9 +1038,22 @@ int disk_int_cmp_abs(disk_int* a, disk_int* b) {
     // If we're here, both have the same number of limbs
     // We need to compare chunk by chunk, starting from the most significant chunks
     
-    // Lock to prevent changes during comparison
-    pthread_mutex_lock(&a->lock);
-    pthread_mutex_lock(&b->lock);
+    // Acquire locks in a consistent order to prevent deadlocks
+    // Always lock the object with the lower memory address first
+    disk_int *first, *second;
+    int swap_result = 0;
+    
+    if ((uintptr_t)a < (uintptr_t)b) {
+        first = a;
+        second = b;
+    } else {
+        first = b;
+        second = a;
+        swap_result = 1; // Will need to negate result if we swap
+    }
+    
+    pthread_mutex_lock(&first->lock);
+    pthread_mutex_lock(&second->lock);
     
     // Flush any dirty cache data to disk
     if (a->dirty && a->cache) {
@@ -1041,8 +1073,8 @@ int disk_int_cmp_abs(disk_int* a, disk_int* b) {
             a->cache = malloc(a->chunk_size * sizeof(mp_limb_t));
             if (!a->cache) {
                 fprintf(stderr, "Error: Memory allocation failed in disk_int_cmp_abs for a->cache\n");
-                pthread_mutex_unlock(&b->lock);
-                pthread_mutex_unlock(&a->lock);
+                pthread_mutex_unlock(&second->lock);
+                pthread_mutex_unlock(&first->lock);
                 return 0; // Error case, assume equal
             }
         }
@@ -1052,8 +1084,8 @@ int disk_int_cmp_abs(disk_int* a, disk_int* b) {
             b->cache = malloc(b->chunk_size * sizeof(mp_limb_t));
             if (!b->cache) {
                 fprintf(stderr, "Error: Memory allocation failed in disk_int_cmp_abs for b->cache\n");
-                pthread_mutex_unlock(&b->lock);
-                pthread_mutex_unlock(&a->lock);
+                pthread_mutex_unlock(&second->lock);
+                pthread_mutex_unlock(&first->lock);
                 return 0; // Error case, assume equal
             }
         }
@@ -1061,8 +1093,8 @@ int disk_int_cmp_abs(disk_int* a, disk_int* b) {
         // Load chunks
         if (load_chunk(a, chunk_idx) != 0 || load_chunk(b, chunk_idx) != 0) {
             fprintf(stderr, "Error: Failed to load chunks in disk_int_cmp_abs\n");
-            pthread_mutex_unlock(&b->lock);
-            pthread_mutex_unlock(&a->lock);
+            pthread_mutex_unlock(&second->lock);
+            pthread_mutex_unlock(&first->lock);
             return 0; // Error case, assume equal
         }
         
@@ -1102,9 +1134,11 @@ int disk_int_cmp_abs(disk_int* a, disk_int* b) {
     result = 0;
     
 cleanup:
-    pthread_mutex_unlock(&b->lock);
-    pthread_mutex_unlock(&a->lock);
-    return result;
+    pthread_mutex_unlock(&second->lock);
+    pthread_mutex_unlock(&first->lock);
+    
+    // If we swapped a and b, negate the result
+    return swap_result ? -result : result;
 }
 
 // Subtract the absolute value of b from the absolute value of a, assuming |a| >= |b|
@@ -3592,101 +3626,60 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         return;
     }
     
-    // For small digit counts, use a simplified in-memory approach
+    // For small digit counts, use a simplified in-memory approach with binary splitting
     if (state->digits <= 1000) {
-        printf("Using simplified in-memory approach for small digit count...\n");
+        printf("Using in-memory binary splitting approach for small digit count...\n");
         
-        // Constants from Chudnovsky algorithm
-        const int D = 12;  // Missing from the original implementation
-
-        // Use MPFR for direct Chudnovsky formula calculation
-        mpfr_t pi, p, q, temp_sqrt, temp_div;
+        // Calculate enough terms for the desired precision
+        unsigned long terms = (unsigned long)ceil(state->digits / 14.0) + 1;
+        printf("Will compute %lu terms using binary splitting\n", terms);
+        
+        // Initialize variables for binary splitting
+        mpz_t P, Q, T;
+        mpz_init(P);
+        mpz_init(Q);
+        mpz_init(T);
+        
+        // Perform binary splitting algorithm (in memory)
+        binary_split_mpz(P, Q, T, 0, terms);
+        
+        printf("Binary splitting complete\n");
+        printf("P size: %d digits\n", mpz_sizeinbase(P, 10));
+        printf("Q size: %d digits\n", mpz_sizeinbase(Q, 10));
+        printf("T size: %d digits\n", mpz_sizeinbase(T, 10));
+        
+        // Compute pi using the correct Chudnovsky formula: pi = (Q * C^(3/2)) / (12 * T)
+        mpfr_t pi, temp_sqrt, temp_div;
         mpfr_prec_t precision = (mpfr_prec_t)(state->digits * 4);
         
         // Initialize MPFR variables
-        mpfr_init2(pi, precision);
-        mpfr_init2(p, precision);    // 'p' accumulator
-        mpfr_init2(q, precision);    // 'q' accumulator
-        mpfr_init2(temp_sqrt, precision);
-        mpfr_init2(temp_div, precision);
+        mpfr_init2(pi, precision);          // Final pi value
+        mpfr_init2(temp_sqrt, precision);   // For C^(3/2)
+        mpfr_init2(temp_div, precision);    // For 12*T
         
         // Initialize constants
-        mpfr_t c, c3_over_24;
-        mpfr_init2(c, precision);
-        mpfr_init2(c3_over_24, precision);
+        mpfr_t mpfr_C, mpfr_D;
+        mpfr_init2(mpfr_C, precision);  // C = 640320
+        mpfr_init2(mpfr_D, precision);  // D = 12
         
         // Set constant values
-        mpfr_set_ui(c, C, MPFR_RNDN);
-        mpfr_set_str(c3_over_24, C3_OVER_24_STR, 10, MPFR_RNDN);
+        mpfr_set_ui(mpfr_C, C, MPFR_RNDN);
+        mpfr_set_ui(mpfr_D, 12, MPFR_RNDN);
         
-        // Initialize accumulators
-        mpfr_set_ui(p, 0, MPFR_RNDN);  // This is our 'p' accumulator
-        mpfr_set_ui(q, 0, MPFR_RNDN);  // This is our 'q' accumulator
+        // Calculate C^(3/2)
+        mpfr_sqrt(temp_sqrt, mpfr_C, MPFR_RNDN);          // sqrt(C)
+        mpfr_mul(temp_sqrt, temp_sqrt, mpfr_C, MPFR_RNDN); // C^(3/2)
         
-        // Calculate enough terms for the desired precision
-        int terms = (int)ceil(state->digits / 14.0) + 1;
-        printf("Will compute %d terms\n", terms);
+        // Convert Q to mpfr and multiply by C^(3/2)
+        mpfr_set_z(pi, Q, MPFR_RNDN);                     // pi = Q
+        mpfr_mul(pi, pi, temp_sqrt, MPFR_RNDN);           // pi = Q * C^(3/2)
         
-        for (int k = 0; k < terms; k++) {
-            int b = k + 1;  // In Chudnovsky's formula, we use 1-based indexing
-            
-            // Following the gmp-chudnovsky.c implementation
-            // For each term, we compute:
-            // - p_term = b^3 * C^3 / 24
-            // - g_term = (6b-5)(2b-1)(6b-1)
-            // - q_term = (-1)^b * g_term * (A + B*b)
-            
-            mpfr_t p_term, g_term, q_term;
-            mpfr_init2(p_term, precision);
-            mpfr_init2(g_term, precision);
-            mpfr_init2(q_term, precision);
-            
-            // Compute p_term = b^3 * C^3 / 24
-            mpfr_set_ui(p_term, b, MPFR_RNDN);
-            mpfr_pow_ui(p_term, p_term, 3, MPFR_RNDN);  // b^3
-            mpfr_mul(p_term, p_term, c3_over_24, MPFR_RNDN);  // b^3 * C^3 / 24
-            
-            // Compute g_term = (6b-5)(2b-1)(6b-1)
-            mpfr_set_ui(g_term, 2*b-1, MPFR_RNDN);  // 2b-1
-            mpfr_mul_ui(g_term, g_term, 6*b-1, MPFR_RNDN);  // (2b-1)(6b-1)
-            mpfr_mul_ui(g_term, g_term, 6*b-5, MPFR_RNDN);  // (6b-5)(2b-1)(6b-1)
-            
-            // Compute q_term = (-1)^b * g_term * (A + B*b)
-            mpfr_set_ui(q_term, b, MPFR_RNDN);
-            mpfr_mul_ui(q_term, q_term, B, MPFR_RNDN);  // B*b
-            mpfr_add_ui(q_term, q_term, A, MPFR_RNDN);  // A + B*b
-            mpfr_mul(q_term, q_term, g_term, MPFR_RNDN);  // g_term * (A + B*b)
-            if (b % 2 == 1) {  // If b is odd, negate
-                mpfr_neg(q_term, q_term, MPFR_RNDN);
-            }
-            
-            // Update p and q accumulators
-            mpfr_add(p, p, p_term, MPFR_RNDN);  // p += p_term
-            mpfr_add(q, q, q_term, MPFR_RNDN);  // q += q_term
-            
-            // Clean up terms
-            mpfr_clear(p_term);
-            mpfr_clear(g_term);
-            mpfr_clear(q_term);
-        }
+        // Convert T to mpfr and multiply by 12
+        mpfr_set_z(temp_div, T, MPFR_RNDN);               // temp_div = T
+        mpfr_mul(temp_div, temp_div, mpfr_D, MPFR_RNDN);  // temp_div = 12 * T
         
-        // Using the Chudnovsky formula: pi = (C/D) * p * sqrt(C) / (A*p + q)
-        
-        // Compute A*p + q
-        mpfr_mul_ui(temp_div, p, A, MPFR_RNDN);  // temp_div = A*p
-        mpfr_add(temp_div, temp_div, q, MPFR_RNDN);  // temp_div = A*p + q
-        
-        // Compute p * (C/D)
-        mpfr_mul_ui(p, p, C/D, MPFR_RNDN);  // p = p * (C/D)
-        
-        // Calculate sqrt(C)
-        mpfr_sqrt_ui(temp_sqrt, C, MPFR_RNDN);  // temp_sqrt = sqrt(C)
-        
-        // Multiply: p = p * sqrt(C)
-        mpfr_mul(p, p, temp_sqrt, MPFR_RNDN);  // p = p * sqrt(C)
-        
-        // Final division: pi = p / temp_div
-        mpfr_div(pi, p, temp_div, MPFR_RNDN);  // pi = p / temp_div
+        // Final division: pi = (Q * C^(3/2)) / (12 * T)
+        mpfr_div(pi, pi, temp_div, MPFR_RNDN);
         
         // Print final value for verification
         mpfr_printf("Final pi value: %.10Rf\n", pi);
@@ -3713,14 +3706,15 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
             fclose(f);
         }
         
-        // Clean up MPFR variables
+        // Clean up variables
+        mpz_clear(P);
+        mpz_clear(Q);
+        mpz_clear(T);
         mpfr_clear(pi);
-        mpfr_clear(p);
-        mpfr_clear(q);
         mpfr_clear(temp_sqrt);
         mpfr_clear(temp_div);
-        mpfr_clear(c);
-        mpfr_clear(c3_over_24);
+        mpfr_clear(mpfr_C);
+        mpfr_clear(mpfr_D);
         
         printf("Pi calculation complete! Result saved to %s\n", state->output_file);
         return;
@@ -3945,9 +3939,9 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         update_job_status(state->job_idx, JOB_STATUS_RUNNING, 0.9, NULL);  // 90% progress
     }
     
-    // Pi = Q * (C/D)^(3/2) / T
+    // Pi = Q * C^(3/2) / (12 * T)  - Correct Chudnovsky formula with factor of 12
     mpz_t mpz_P, mpz_Q, mpz_T;
-    mpfr_t mpfr_pi, mpfr_C, mpfr_temp;
+    mpfr_t mpfr_pi, mpfr_C, mpfr_temp, mpfr_D;
     
     mpz_init(mpz_P);
     mpz_init(mpz_Q);
@@ -3959,6 +3953,7 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     mpfr_init2(mpfr_pi, precision);
     mpfr_init2(mpfr_C, precision);
     mpfr_init2(mpfr_temp, precision);
+    mpfr_init2(mpfr_D, precision);
     
     // Get P, Q, T from disk
     disk_int_get_mpz(mpz_P, &state->data.chudnovsky.P);
@@ -3979,6 +3974,9 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     // C = 640320
     mpfr_set_ui(mpfr_C, C, MPFR_RNDN);
     
+    // D = 12 (Chudnovsky algorithm constant)
+    mpfr_set_ui(mpfr_D, 12, MPFR_RNDN);
+    
     // temp = C^(3/2)
     mpfr_sqrt(mpfr_temp, mpfr_C, MPFR_RNDN);
     mpfr_mul(mpfr_temp, mpfr_temp, mpfr_C, MPFR_RNDN);
@@ -3996,10 +3994,11 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         mpz_set_ui(mpz_T, 1); // Prevent division by zero
     }
     
-    // Convert T to mpfr
+    // Convert T to mpfr and multiply by D=12
     mpfr_set_z(mpfr_temp, mpz_T, MPFR_RNDN);
+    mpfr_mul(mpfr_temp, mpfr_temp, mpfr_D, MPFR_RNDN);  // 12 * T
     
-    // pi = pi / T
+    // pi = pi / (12 * T)
     mpfr_div(mpfr_pi, mpfr_pi, mpfr_temp, MPFR_RNDN);
     
     // Debug output
@@ -4010,6 +4009,7 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     mpz_clear(mpz_Q);
     mpz_clear(mpz_T);
     mpfr_clear(mpfr_C);
+    mpfr_clear(mpfr_D);
     
     // Write the result to file
     FILE* f = fopen(state->output_file, "w");
@@ -4161,8 +4161,30 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
 // File pointer for logging
 FILE* log_file = NULL;
 
-// Log message with timestamp and level (supports printf-style formats)
-void log_message(const char* level, const char* format, ...) {
+// Unified logging function that works in both server and CLI modes
+void unified_log(int level, const char* format, ...) {
+    // Get level string representation
+    const char *level_str;
+    switch (level) {
+        case LOG_LEVEL_DEBUG:
+            level_str = "debug";
+            break;
+        case LOG_LEVEL_INFO:
+            level_str = "info";
+            break;
+        case LOG_LEVEL_WARNING:
+            level_str = "warning";
+            break;
+        case LOG_LEVEL_ERROR:
+            level_str = "error";
+            break;
+        case LOG_LEVEL_CRITICAL:
+            level_str = "critical";
+            break;
+        default:
+            level_str = "unknown";
+    }
+    
     // Get current time
     time_t now = time(NULL);
     struct tm* tm_info = localtime(&now);
@@ -4178,15 +4200,54 @@ void log_message(const char* level, const char* format, ...) {
     
     // Create log message with format: [timestamp] level: message
     char log_output[BUFFER_SIZE];
-    snprintf(log_output, BUFFER_SIZE, "[%s] %s: %s", timestamp, level, formatted_message);
+    snprintf(log_output, BUFFER_SIZE, "[%s] %s: %s", timestamp, level_str, formatted_message);
     
-    // Output to console or file based on configuration
-    if (log_file) {
+    // Check if in server mode and logging is initialized
+    if (config.server_mode && log_file) {
+        // Output to log file in server mode
         fprintf(log_file, "%s\n", log_output);
-        fflush(log_file);  // Ensure message is written immediately
+        fflush(log_file);
+        
+        // Also output critical and errors to stderr
+        if (level >= LOG_LEVEL_ERROR) {
+            fprintf(stderr, "%s\n", log_output);
+        }
     } else {
-        printf("%s\n", log_output);
+        // In CLI mode or early initialization, output to stderr
+        // Only output if the log level is at or above the configured level
+        if (level >= config.log_level) {
+            fprintf(stderr, "%s\n", log_output);
+        }
     }
+}
+
+// Log message with timestamp and level (supports printf-style formats)
+// Legacy function for backward compatibility
+void log_message(const char* level, const char* format, ...) {
+    // Convert level string to int
+    int int_level;
+    if (strcasecmp(level, "debug") == 0) {
+        int_level = LOG_LEVEL_DEBUG;
+    } else if (strcasecmp(level, "info") == 0) {
+        int_level = LOG_LEVEL_INFO;
+    } else if (strcasecmp(level, "warning") == 0) {
+        int_level = LOG_LEVEL_WARNING;
+    } else if (strcasecmp(level, "error") == 0) {
+        int_level = LOG_LEVEL_ERROR;
+    } else if (strcasecmp(level, "critical") == 0) {
+        int_level = LOG_LEVEL_CRITICAL;
+    } else {
+        int_level = LOG_LEVEL_INFO; // Default to info
+    }
+    
+    // Forward to unified_log
+    va_list args;
+    va_start(args, format);
+    char formatted_message[BUFFER_SIZE];
+    vsnprintf(formatted_message, BUFFER_SIZE, format, args);
+    va_end(args);
+    
+    unified_log(int_level, "%s", formatted_message);
 }
 
 // Open log file based on configuration
@@ -5636,6 +5697,12 @@ void handle_sigint(int sig) {
     if (g_calc_pool) {
         log_message("info", "Shutting down calculation thread pool...");
         calc_thread_pool_shutdown(g_calc_pool);
+        
+        // Free the memory allocated for the pool in run_server_mode
+        // Note: In CLI mode, g_calc_pool points to a stack variable, so we check for the server mode
+        if (config.server_mode) {
+            free(g_calc_pool);
+        }
         g_calc_pool = NULL;
     }
     
