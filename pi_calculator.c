@@ -2280,30 +2280,12 @@ void binary_split_mpz(mpz_t P, mpz_t Q, mpz_t T, unsigned long a, unsigned long 
         // Use a flag to track errors for proper cleanup
         int error_occurred = 0;
         
-        // P = (6*b - 5) * (2*b - 1) * (6*b - 1)
+        // Q = (6*b - 5) * (2*b - 1) * (6*b - 1)
         mpz_set_ui(t1, 6 * b - 5);
         mpz_set_ui(t2, 2 * b - 1);
         mpz_mul(t3, t1, t2);
         mpz_set_ui(t1, 6 * b - 1);
-        mpz_mul(P, t3, t1);
-        
-        // Check for errors in computation
-        if (mpz_sgn(P) == 0) {
-            fprintf(stderr, "Warning: Zero P value in base case of binary_split_mpz\n");
-            mpz_set_ui(P, 1);
-            error_occurred = 1;
-        }
-        
-        // Q = b^3 * C^3 / 24
-        mpz_set_ui(t1, b);
-        mpz_pow_ui(t2, t1, 3);
-        // Fix: Use string constant for C3_OVER_24 instead of overflowing macro
-        if (mpz_set_str(t1, C3_OVER_24_STR, 10) != 0) {
-            fprintf(stderr, "Error: Failed to set C3_OVER_24_STR in binary_split_mpz\n");
-            error_occurred = 1;
-            mpz_set_ui(t1, 1);  // Set a safe default
-        }
-        mpz_mul(Q, t2, t1);
+        mpz_mul(Q, t3, t1);
         
         // Check for errors in computation
         if (mpz_sgn(Q) == 0) {
@@ -2312,11 +2294,29 @@ void binary_split_mpz(mpz_t P, mpz_t Q, mpz_t T, unsigned long a, unsigned long 
             error_occurred = 1;
         }
         
-        // T = P * (A + B*b)
+        // P = b^3 * C^3 / 24
+        mpz_set_ui(t1, b);
+        mpz_pow_ui(t2, t1, 3);
+        // Fix: Use string constant for C3_OVER_24 instead of overflowing macro
+        if (mpz_set_str(t1, C3_OVER_24_STR, 10) != 0) {
+            fprintf(stderr, "Error: Failed to set C3_OVER_24_STR in binary_split_mpz\n");
+            error_occurred = 1;
+            mpz_set_ui(t1, 1);  // Set a safe default
+        }
+        mpz_mul(P, t2, t1);
+        
+        // Check for errors in computation
+        if (mpz_sgn(P) == 0) {
+            fprintf(stderr, "Warning: Zero P value in base case of binary_split_mpz\n");
+            mpz_set_ui(P, 1);
+            error_occurred = 1;
+        }
+        
+        // T = Q * (A + B*b)
         mpz_set_ui(t1, B);
         mpz_mul_ui(t2, t1, b);
         mpz_add_ui(t3, t2, A);
-        mpz_mul(T, P, t3);
+        mpz_mul(T, Q, t3);
         
         // Negate if needed (alternating series)
         if (b % 2 == 1) {
@@ -3654,38 +3654,38 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         printf("Q size: %zu digits\n", mpz_sizeinbase(Q, 10));
         printf("T size: %zu digits\n", mpz_sizeinbase(T, 10));
         
-        // Compute pi using the correct Chudnovsky formula: pi = (Q * C^(3/2)) / (12 * T)
-        mpfr_t pi, temp_sqrt, temp_div;
+        // Compute pi using the correct Chudnovsky formula: pi = (426880 * sqrt(10005)) / (P * (13591409 + 545140134 * n))
+        mpfr_t pi, temp_sqrt, temp_div, temp_mul, temp_add;
         mpfr_prec_t precision = (mpfr_prec_t)(state->digits * 4);
         
         // Initialize MPFR variables
         mpfr_init2(pi, precision);          // Final pi value
-        mpfr_init2(temp_sqrt, precision);   // For C^(3/2)
-        mpfr_init2(temp_div, precision);    // For 12*T
+        mpfr_init2(temp_sqrt, precision);   // For sqrt(10005)
+        mpfr_init2(temp_div, precision);    // For denominator
+        mpfr_init2(temp_mul, precision);    // For numerator
+        mpfr_init2(temp_add, precision);    // For Q+A*P
         
         // Initialize constants
-        mpfr_t mpfr_C, mpfr_D;
+        mpfr_t mpfr_C;
         mpfr_init2(mpfr_C, precision);  // C = 640320
-        mpfr_init2(mpfr_D, precision);  // D = 12
         
         // Set constant values
         mpfr_set_ui(mpfr_C, C, MPFR_RNDN);
-        mpfr_set_ui(mpfr_D, 12, MPFR_RNDN);
         
-        // Calculate C^(3/2)
-        mpfr_sqrt(temp_sqrt, mpfr_C, MPFR_RNDN);          // sqrt(C)
-        mpfr_mul(temp_sqrt, temp_sqrt, mpfr_C, MPFR_RNDN); // C^(3/2)
+        // Calculate numerator: 426880 * sqrt(10005)
+        mpfr_set_ui(temp_sqrt, 10005, MPFR_RNDN);
+        mpfr_sqrt(temp_sqrt, temp_sqrt, MPFR_RNDN);
+        mpfr_set_ui(temp_mul, 426880, MPFR_RNDN);
+        mpfr_mul(temp_mul, temp_mul, temp_sqrt, MPFR_RNDN);
         
-        // Convert Q to mpfr and multiply by C^(3/2)
-        mpfr_set_z(pi, Q, MPFR_RNDN);                     // pi = Q
-        mpfr_mul(pi, pi, temp_sqrt, MPFR_RNDN);           // pi = Q * C^(3/2)
+        // Calculate denominator: Q + A*P
+        mpfr_set_z(temp_add, P, MPFR_RNDN);           // temp_add = P
+        mpfr_mul_ui(temp_add, temp_add, A, MPFR_RNDN); // temp_add = A*P
+        mpfr_set_z(temp_div, Q, MPFR_RNDN);           // temp_div = Q
+        mpfr_add(temp_div, temp_div, temp_add, MPFR_RNDN); // temp_div = Q + A*P
         
-        // Convert T to mpfr and multiply by 12
-        mpfr_set_z(temp_div, T, MPFR_RNDN);               // temp_div = T
-        mpfr_mul(temp_div, temp_div, mpfr_D, MPFR_RNDN);  // temp_div = 12 * T
-        
-        // Final division: pi = (Q * C^(3/2)) / (12 * T)
-        mpfr_div(pi, pi, temp_div, MPFR_RNDN);
+        // Final division: pi = (426880 * sqrt(10005)) / (Q + A*P)
+        mpfr_div(pi, temp_mul, temp_div, MPFR_RNDN);
         
         // Print final value for verification
         mpfr_printf("Final pi value: %.10Rf\n", pi);
@@ -3719,8 +3719,9 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         mpfr_clear(pi);
         mpfr_clear(temp_sqrt);
         mpfr_clear(temp_div);
+        mpfr_clear(temp_mul);
+        mpfr_clear(temp_add);
         mpfr_clear(mpfr_C);
-        mpfr_clear(mpfr_D);
         
         printf("Pi calculation complete! Result saved to %s\n", state->output_file);
         return;
