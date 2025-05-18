@@ -159,7 +159,8 @@ typedef struct calculation_job {
 extern calculation_job jobs[MAX_JOBS];
 extern pthread_mutex_t jobs_lock;
 extern bool g_server_running;
-extern volatile bool g_shutdown_flag;
+// Forward declaration of global shutdown flag 
+volatile bool g_shutdown_flag;
 
 // Config structure forward declaration
 typedef struct {
@@ -1138,17 +1139,45 @@ void disk_int_get_mpz(mpz_t mpz_val, disk_int* d_int) {
     if (mpz_sgn(mpz_val) == 0 && d_int->total_size_in_limbs > 0) {
         // If the value is zero but we expected non-zero data, this indicates a data corruption
         // or import issue with large integers. Let's try to reconstruct the value from limbs directly.
-        mp_limb_t first_limb = limbs[0];
-        if (first_limb != 0) {
-            // If the first limb is non-zero, use just that limb to set mpz_val
-            fprintf(stderr, "DEBUG: Recovering non-zero value from limbs[0]=%lu for %s\n", 
-                    (unsigned long)first_limb, d_int->file_path);
-            mpz_set_ui(mpz_val, (unsigned long)first_limb);
+        
+        // First check all limbs to see if any are non-zero (not just limb[0])
+        mp_limb_t first_non_zero_limb = 0;
+        size_t non_zero_idx = 0;
+        bool found_non_zero = false;
+        
+        for (size_t i = 0; i < d_int->total_size_in_limbs && i < 200; i++) {
+            if (limbs[i] != 0) {
+                first_non_zero_limb = limbs[i];
+                non_zero_idx = i;
+                found_non_zero = true;
+                break;
+            }
+        }
+        
+        if (found_non_zero) {
+            // If any limb is non-zero, use it to set mpz_val
+            fprintf(stderr, "DEBUG: Recovering non-zero value from limbs[%zu]=%lu for %s\n", 
+                    non_zero_idx, (unsigned long)first_non_zero_limb, d_int->file_path);
+            
+            // Create a proper mpz value using this limb, shifted if necessary
+            mpz_t temp;
+            mpz_init(temp);
+            mpz_set_ui(temp, (unsigned long)first_non_zero_limb);
+            
+            // Shift by the appropriate amount based on the index
+            if (non_zero_idx > 0) {
+                mpz_mul_2exp(temp, temp, GMP_NUMB_BITS * non_zero_idx);
+            }
+            
+            // Copy to the destination
+            mpz_set(mpz_val, temp);
             
             // Apply sign if needed
             if (d_int->sign < 0) {
                 mpz_neg(mpz_val, mpz_val);
             }
+            
+            mpz_clear(temp);
         } else {
             fprintf(stderr, "WARNING: Zero value detected after import for %s (total_size: %zu limbs)\n", 
                     d_int->file_path, d_int->total_size_in_limbs);
@@ -4580,50 +4609,11 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         mpfr_set_d(mpfr_pi, 3.14159265358979323846, MPFR_RNDN);
     }
     
-    // Write the result to file
-    FILE* f = fopen(state->output_file, "w");
-    if (f) {
-        // First print a safe version
-        fprintf(f, "Pi approximation (safe format): ");
-        mpfr_fprintf(f, "%.50RNf\n\n", mpfr_pi);
-        
-        // Use a try-catch approach to handle potential mpfr_get_str issues
-        char *str_pi = NULL;
-        mpfr_exp_t exp = 0;
-        
-        // Safety limit on digits
-        unsigned long safe_digits = state->digits;
-        if (safe_digits > 100000) {
-            fprintf(stderr, "WARNING: Limiting digit output to 100000 for safety\n");
-            safe_digits = 100000;
-        }
-        
-        // Now try to get full precision string
-        str_pi = mpfr_get_str(NULL, &exp, 10, safe_digits + 2, mpfr_pi, MPFR_RNDN);
-        
-        if (str_pi != NULL) {
-            fprintf(f, "Full precision Pi value: %c.%s\n", str_pi[0], str_pi + 1);
-            mpfr_free_str(str_pi);
-        } else {
-            fprintf(f, "Could not generate full precision string representation\n");
-        }
-        
-        fclose(f);
-    }
-    
     // Clean up mpz variables (but not mpfr ones yet as we need them for output)
     mpz_clear(mpz_P);
     mpz_clear(mpz_Q);
     mpz_clear(mpz_T);
     mpz_clear(mpz_APplusQ);
-    
-    // Check if result is NaN or Infinity
-    if (!mpfr_number_p(mpfr_pi)) {
-        fprintf(stderr, "WARNING: Pi calculation resulted in a non-numeric value (NaN or Inf)\n");
-        fprintf(stderr, "This usually indicates a division by zero or invalid operation\n");
-        // Set to a default value to avoid segfault
-        mpfr_set_d(mpfr_pi, 3.14159265358979323846, MPFR_RNDN);
-    }
     
     // Write the result to file before cleaning up mpfr variables
     FILE* f = fopen(state->output_file, "w");
@@ -4659,43 +4649,100 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
                     fprintf(f, "%c.%s", str_pi[0], str_pi + 1);
                 } else {
                     // Got invalid result, generate a detailed error report
+                    time_t now = time(NULL);
+                    char time_str[32];
+                    struct tm *tm_info = localtime(&now);
+                    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+                    
+                    fprintf(f, "ERROR: Pi calculation failed to produce valid result\n\n");
+                    fprintf(f, "Diagnostic Information:\n");
+                    fprintf(f, "  Timestamp: %s\n", time_str);
+                    fprintf(f, "  Algorithm: %s\n", state->algorithm == ALGO_CHUDNOVSKY ? "Chudnovsky" : "Gauss-Legendre");
+                    fprintf(f, "  Requested digits: %lu\n", state->digits);
+                    fprintf(f, "  Out-of-core mode: %s\n", state->out_of_core ? "Yes" : "No");
+                    fprintf(f, "  Invalid result value: '%s'\n", str_pi);
+                    fprintf(f, "  Working directory: %s\n", state->work_dir);
+                    fprintf(f, "  Memory allocation check: %s\n", mpfr_mp_memory_cleanup() ? "Leaks detected" : "No leaks detected");
+                    
+                    // Log additional error info
+                    fprintf(stderr, "Error: Pi calculation failed to produce valid result at %s\n", time_str);
+                    fprintf(stderr, "  Algorithm: %s, Digits: %lu, Result: '%s'\n", 
+                            state->algorithm == ALGO_CHUDNOVSKY ? "Chudnovsky" : "Gauss-Legendre",
+                            state->digits, str_pi);
+                    
+                    // Create error report file for diagnostics
+                    char error_file[MAX_PATH];
+                    snprintf(error_file, sizeof(error_file), "%s/error_report_%ld.json", 
+                             state->work_dir, (long)now);
+                    
+                    FILE* error_report = fopen(error_file, "w");
+                    if (error_report) {
+                        fprintf(error_report, "{\n");
+                        fprintf(error_report, "  \"error\": \"Pi calculation failed to produce valid result\",\n");
+                        fprintf(error_report, "  \"timestamp\": %ld,\n", (long)now);
+                        fprintf(error_report, "  \"algorithm\": \"%s\",\n", 
+                                state->algorithm == ALGO_CHUDNOVSKY ? "Chudnovsky" : "Gauss-Legendre");
+                        fprintf(error_report, "  \"digits\": %lu,\n", state->digits);
+                        fprintf(error_report, "  \"out_of_core\": %s,\n", state->out_of_core ? "true" : "false");
+                        fprintf(error_report, "  \"invalid_result\": \"%s\",\n", str_pi);
+                        fprintf(error_report, "  \"work_dir\": \"%s\",\n", state->work_dir);
+                        fprintf(error_report, "  \"job_id\": %d\n", state->job_idx);
+                        fprintf(error_report, "}\n");
+                        fclose(error_report);
+                        
+                        fprintf(stderr, "  Error report saved to: %s\n", error_file);
+                    }
+                    
+                    // Update job status if this is part of a job
+                    if (state->job_idx >= 0) {
+                        char error_message[MAX_JOB_ERROR_MSG];
+                        snprintf(error_message, sizeof(error_message), 
+                                 "Calculation failed: Invalid result produced ('%s')", str_pi);
+                        update_job_status(state->job_idx, JOB_STATUS_FAILED, 1.0, error_message);
+                    }
+                }
+                
+                // Free the string allocated by mpfr_get_str
+                mpfr_free_str(str_pi);
+            } else {
+                // Handle NULL result from mpfr_get_str with detailed error report
                 time_t now = time(NULL);
                 char time_str[32];
                 struct tm *tm_info = localtime(&now);
                 strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
                 
-                fprintf(f, "ERROR: Pi calculation failed to produce valid result\n\n");
+                fprintf(f, "ERROR: Pi calculation failed (mpfr_get_str returned NULL)\n\n");
                 fprintf(f, "Diagnostic Information:\n");
                 fprintf(f, "  Timestamp: %s\n", time_str);
                 fprintf(f, "  Algorithm: %s\n", state->algorithm == ALGO_CHUDNOVSKY ? "Chudnovsky" : "Gauss-Legendre");
                 fprintf(f, "  Requested digits: %lu\n", state->digits);
                 fprintf(f, "  Out-of-core mode: %s\n", state->out_of_core ? "Yes" : "No");
-                fprintf(f, "  Invalid result value: '%s'\n", str_pi);
                 fprintf(f, "  Working directory: %s\n", state->work_dir);
+                fprintf(f, "  MPFR version: %s\n", mpfr_get_version());
                 fprintf(f, "  Memory allocation check: %s\n", mpfr_mp_memory_cleanup() ? "Leaks detected" : "No leaks detected");
                 
-                // Log additional error info
-                fprintf(stderr, "Error: Pi calculation failed to produce valid result at %s\n", time_str);
-                fprintf(stderr, "  Algorithm: %s, Digits: %lu, Result: '%s'\n", 
+                // Log error details
+                fprintf(stderr, "Error: mpfr_get_str returned NULL in Pi calculation at %s\n", time_str);
+                fprintf(stderr, "  Algorithm: %s, Digits: %lu\n", 
                         state->algorithm == ALGO_CHUDNOVSKY ? "Chudnovsky" : "Gauss-Legendre",
-                        state->digits, str_pi);
-                
+                        state->digits);
+            
                 // Create error report file for diagnostics
                 char error_file[MAX_PATH];
-                snprintf(error_file, sizeof(error_file), "%s/error_report_%ld.json", 
+                snprintf(error_file, sizeof(error_file), "%s/error_report_null_%ld.json", 
                          state->work_dir, (long)now);
                 
                 FILE* error_report = fopen(error_file, "w");
                 if (error_report) {
                     fprintf(error_report, "{\n");
-                    fprintf(error_report, "  \"error\": \"Pi calculation failed to produce valid result\",\n");
+                    fprintf(error_report, "  \"error\": \"Pi calculation failed (mpfr_get_str returned NULL)\",\n");
                     fprintf(error_report, "  \"timestamp\": %ld,\n", (long)now);
                     fprintf(error_report, "  \"algorithm\": \"%s\",\n", 
                             state->algorithm == ALGO_CHUDNOVSKY ? "Chudnovsky" : "Gauss-Legendre");
                     fprintf(error_report, "  \"digits\": %lu,\n", state->digits);
                     fprintf(error_report, "  \"out_of_core\": %s,\n", state->out_of_core ? "true" : "false");
-                    fprintf(error_report, "  \"invalid_result\": \"%s\",\n", str_pi);
                     fprintf(error_report, "  \"work_dir\": \"%s\",\n", state->work_dir);
+                    fprintf(error_report, "  \"mpfr_version\": \"%s\",\n", mpfr_get_version());
                     fprintf(error_report, "  \"job_id\": %d\n", state->job_idx);
                     fprintf(error_report, "}\n");
                     fclose(error_report);
@@ -4707,66 +4754,10 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
                 if (state->job_idx >= 0) {
                     char error_message[MAX_JOB_ERROR_MSG];
                     snprintf(error_message, sizeof(error_message), 
-                             "Calculation failed: Invalid result produced ('%s')", str_pi);
+                             "Calculation failed: mpfr_get_str returned NULL, error report: %s", 
+                             error_file);
                     update_job_status(state->job_idx, JOB_STATUS_FAILED, 1.0, error_message);
                 }
-            }
-            
-            // Free the string allocated by mpfr_get_str
-            mpfr_free_str(str_pi);
-        } else {
-            // Handle NULL result from mpfr_get_str with detailed error report
-            time_t now = time(NULL);
-            char time_str[32];
-            struct tm *tm_info = localtime(&now);
-            strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
-            
-            fprintf(f, "ERROR: Pi calculation failed (mpfr_get_str returned NULL)\n\n");
-            fprintf(f, "Diagnostic Information:\n");
-            fprintf(f, "  Timestamp: %s\n", time_str);
-            fprintf(f, "  Algorithm: %s\n", state->algorithm == ALGO_CHUDNOVSKY ? "Chudnovsky" : "Gauss-Legendre");
-            fprintf(f, "  Requested digits: %lu\n", state->digits);
-            fprintf(f, "  Out-of-core mode: %s\n", state->out_of_core ? "Yes" : "No");
-            fprintf(f, "  Working directory: %s\n", state->work_dir);
-            fprintf(f, "  MPFR version: %s\n", mpfr_get_version());
-            fprintf(f, "  Memory allocation check: %s\n", mpfr_mp_memory_cleanup() ? "Leaks detected" : "No leaks detected");
-            
-            // Log error details
-            fprintf(stderr, "Error: mpfr_get_str returned NULL in Pi calculation at %s\n", time_str);
-            fprintf(stderr, "  Algorithm: %s, Digits: %lu\n", 
-                    state->algorithm == ALGO_CHUDNOVSKY ? "Chudnovsky" : "Gauss-Legendre",
-                    state->digits);
-            
-            // Create error report file for diagnostics
-            char error_file[MAX_PATH];
-            snprintf(error_file, sizeof(error_file), "%s/error_report_null_%ld.json", 
-                     state->work_dir, (long)now);
-            
-            FILE* error_report = fopen(error_file, "w");
-            if (error_report) {
-                fprintf(error_report, "{\n");
-                fprintf(error_report, "  \"error\": \"Pi calculation failed (mpfr_get_str returned NULL)\",\n");
-                fprintf(error_report, "  \"timestamp\": %ld,\n", (long)now);
-                fprintf(error_report, "  \"algorithm\": \"%s\",\n", 
-                        state->algorithm == ALGO_CHUDNOVSKY ? "Chudnovsky" : "Gauss-Legendre");
-                fprintf(error_report, "  \"digits\": %lu,\n", state->digits);
-                fprintf(error_report, "  \"out_of_core\": %s,\n", state->out_of_core ? "true" : "false");
-                fprintf(error_report, "  \"work_dir\": \"%s\",\n", state->work_dir);
-                fprintf(error_report, "  \"mpfr_version\": \"%s\",\n", mpfr_get_version());
-                fprintf(error_report, "  \"job_id\": %d\n", state->job_idx);
-                fprintf(error_report, "}\n");
-                fclose(error_report);
-                
-                fprintf(stderr, "  Error report saved to: %s\n", error_file);
-            }
-            
-            // Update job status if this is part of a job
-            if (state->job_idx >= 0) {
-                char error_message[MAX_JOB_ERROR_MSG];
-                snprintf(error_message, sizeof(error_message), 
-                         "Calculation failed: mpfr_get_str returned NULL, error report: %s", 
-                         error_file);
-                update_job_status(state->job_idx, JOB_STATUS_FAILED, 1.0, error_message);
             }
         }
         
@@ -4793,16 +4784,21 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     mpfr_clear(mpfr_sqrt_C);
     mpfr_clear(mpfr_temp);
     mpfr_clear(mpfr_pi);
-}
+} // End of calculate_pi_chudnovsky function
+
+// Let the compiler know we're at file scope
+;
 
 // ==========================================================================
 // Logging System
 // ==========================================================================
 
+// Implementation of logging and configuration functions
+
 // File pointer for logging
 FILE* log_file = NULL;
 
-// Unified logging function that works in both server and CLI modes
+// Unified logging function implementation 
 void unified_log(int level, const char* format, ...) {
     // Get level string representation
     const char *level_str;
@@ -4916,6 +4912,7 @@ void close_log_file() {
 
 // Global state flags
 bool g_server_running = false;  // Server active flag
+// Global shutdown flag
 volatile bool g_shutdown_flag = false;   // Shutdown requested flag
 
 // Global configuration
@@ -6212,8 +6209,8 @@ void* handle_http_request(void* arg) {
 http_thread_pool* g_http_pool = NULL;
 calc_thread_pool* g_calc_pool = NULL;
 int g_server_sock = -1;
-// Make g_shutdown_flag volatile for atomic access
-extern volatile bool g_shutdown_flag;
+// Access g_shutdown_flag which is defined earlier in the file
+// There's no need to redeclare it with extern
 
 // Handle SIGINT (Ctrl+C) - graceful shutdown
 // Static flag to prevent multiple calls to handle_sigint
