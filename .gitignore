@@ -1,0 +1,27 @@
+# Ignore compiled binaries
+pi_hybrid
+piserver
+
+# Ignore binary and intermediate files
+*.bin
+*.o
+*.a
+*.so
+*.exe
+
+# Ignore backup files
+*.bak
+*.backup
+*~
+
+# Ignore pi calculation results 
+pi_*_*.txt
+pi_calc/pi_*.txt
+
+# Ignore log files
+*.log
+
+# Ignore user-specific files
+.vscode/
+.idea/
+.claude/

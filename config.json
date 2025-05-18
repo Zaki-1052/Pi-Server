@@ -1,0 +1,18 @@
+{
+  "ip_address": "0.0.0.0",
+  "port": 8081,
+  "max_http_threads": 4,
+  "max_calc_threads": 4,
+  "max_digits": 5000000,
+  "memory_limit": 20,
+  "default_algorithm": "CH",
+  "gl_iterations": 10,
+  "gl_precision_bits": 128,
+  "logging": {
+    "level": "debug",
+    "output": "console"
+  },
+  "work_dir": "./pi_calc",
+  "checkpointing_enabled": true,
+  "checkpoint_interval": 600
+}
