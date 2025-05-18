@@ -4264,7 +4264,24 @@ void handle_calculation_request(int client_sock, const char* algo_str, const cha
         // Use the global calculation thread pool, not a local one
         if (!g_calc_pool) {
             fprintf(stderr, "Error: Global calculation thread pool is not initialized\n");
-            return NULL;
+            
+            // Send HTTP 500 error to client
+            json_object_object_add(response, "status", json_object_new_string("error"));
+            json_object_object_add(response, "message", json_object_new_string("Internal server error: Calculation service unavailable"));
+            json_object_object_add(response, "code", json_object_new_int(500));
+            
+            const char* json_str = json_object_to_json_string(response);
+            char http_response_buf[BUFFER_SIZE];
+            snprintf(http_response_buf, BUFFER_SIZE,
+                    "HTTP/1.1 500 Internal Server Error\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: %zu\r\n\r\n%s", 
+                    strlen(json_str), json_str);
+            
+            write(client_sock, http_response_buf, strlen(http_response_buf));
+            json_object_put(response);
+            close(client_sock);
+            return;
         }
         
         // Perform calculation
@@ -5069,9 +5086,9 @@ void run_server_mode() {
     g_calc_pool = (calc_thread_pool*)malloc(sizeof(calc_thread_pool));
     if (!g_calc_pool) {
         fprintf(stderr, "Failed to allocate memory for calculation thread pool\n");
-        close(server_socket);
+        close(g_server_sock);
         http_thread_pool_shutdown(&http_pool);
-        return 1;
+        exit(1);  // Fatal error, directly exit instead of returning
     }
     calc_thread_pool_init(g_calc_pool, config.max_calc_threads);
     calc_thread_pool_start(g_calc_pool);
