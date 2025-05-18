@@ -45,6 +45,12 @@
 // Signal handling
 #include <signal.h>
 
+// Signal handler for segmentation faults
+void segfault_handler(int sig) {
+    fprintf(stderr, "DEBUG: Caught SIGSEGV (segmentation fault)\n");
+    exit(1);
+}
+
 // ==========================================================================
 // Constants and Macros
 // ==========================================================================
@@ -257,11 +263,13 @@ int mkdir_recursive(const char* path, mode_t mode) {
 
 // Initialize a disk integer
 void disk_int_init(disk_int* d_int, const char* base_path) {
+    printf("DEBUG: disk_int_init with base_path=%s\n", base_path ? base_path : "NULL");
     // First, ensure the structure is cleared
     memset(d_int, 0, sizeof(disk_int));
     
     // Make sure base_path is valid
     if (!base_path || base_path[0] == '\0') {
+        printf("DEBUG: Invalid base_path in disk_int_init\n");
         fprintf(stderr, "Error: Invalid base path for disk integer\n");
         d_int->file_path[0] = '\0';
         return;
@@ -271,16 +279,20 @@ void disk_int_init(disk_int* d_int, const char* base_path) {
     static int counter = 0;
     snprintf(d_int->file_path, MAX_PATH, "%s/int_%d_%lu.bin", 
              base_path, (int)getpid(), (unsigned long)counter++);
+    printf("DEBUG: Generated file path: %s\n", d_int->file_path);
     
     // Extract directory path from file path
     char dir_path[MAX_PATH];
     char* last_slash = strrchr(d_int->file_path, '/');
     if (last_slash) {
+        printf("DEBUG: Found last slash in path\n");
         size_t dir_len = last_slash - d_int->file_path;
         strncpy(dir_path, d_int->file_path, dir_len);
         dir_path[dir_len] = '\0';
+        printf("DEBUG: Extracted dir_path: %s\n", dir_path);
         
         // Create directory structure recursively
+        printf("DEBUG: Creating directory structure: %s\n", dir_path);
         if (mkdir_recursive(dir_path, 0755) != 0) {
             fprintf(stderr, "Error creating directory structure for: %s\n", d_int->file_path);
             d_int->file_path[0] = '\0';
@@ -297,8 +309,10 @@ void disk_int_init(disk_int* d_int, const char* base_path) {
     pthread_mutex_init(&d_int->lock, NULL);
     
     // Create an empty file
+    printf("DEBUG: Creating empty file: %s\n", d_int->file_path);
     FILE* f = fopen(d_int->file_path, "wb");
     if (!f) {
+        printf("DEBUG: Failed to create file, errno=%d (%s)\n", errno, strerror(errno));
         fprintf(stderr, "Error creating disk integer file: %s\n", d_int->file_path);
         d_int->file_path[0] = '\0';  // Mark as invalid
         pthread_mutex_destroy(&d_int->lock);
@@ -641,22 +655,27 @@ struct chudnovsky_state {
 
 // Initialize Chudnovsky state
 void chudnovsky_state_init(chudnovsky_state* state, const char* base_path) {
+    printf("DEBUG: chudnovsky_state_init with base_path=%s\n", base_path ? base_path : "NULL");
     char p_path[MAX_PATH], q_path[MAX_PATH], t_path[MAX_PATH];
     
+    printf("DEBUG: Joining %s with P\n", base_path ? base_path : "NULL");
     if (safe_path_join(p_path, MAX_PATH, base_path, "P") < 0) {
         fprintf(stderr, "Error: Path too long for Chudnovsky state P\n");
         // Since this is initialization, it's serious enough to exit or handle specially
         exit(1);
     }
+    printf("DEBUG: Joining %s with Q\n", base_path ? base_path : "NULL");
     if (safe_path_join(q_path, MAX_PATH, base_path, "Q") < 0) {
         fprintf(stderr, "Error: Path too long for Chudnovsky state Q\n");
         exit(1);
     }
+    printf("DEBUG: Joining %s with T\n", base_path ? base_path : "NULL");
     if (safe_path_join(t_path, MAX_PATH, base_path, "T") < 0) {
         fprintf(stderr, "Error: Path too long for Chudnovsky state T\n");
         exit(1);
     }
     
+    printf("DEBUG: Paths: P=%s, Q=%s, T=%s\n", p_path, q_path, t_path);
     disk_int_init(&state->P, p_path);
     disk_int_init(&state->Q, q_path);
     disk_int_init(&state->T, t_path);
@@ -802,8 +821,10 @@ void binary_split_mpz(mpz_t P, mpz_t Q, mpz_t T, unsigned long a, unsigned long 
 // Binary splitting on disk for large ranges
 void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long b, 
                        const char* base_path, size_t memory_threshold) {
+    printf("DEBUG: binary_split_disk a=%lu, b=%lu, base_path=%s\n", a, b, base_path ? base_path : "NULL");
     // Safety check for invalid range
     if (a >= b) {
+        printf("DEBUG: Invalid range a=%lu, b=%lu\n", a, b);
         fprintf(stderr, "Warning: Invalid range for binary_split_disk: a=%lu, b=%lu\n", a, b);
         // Initialize result with default values to prevent crashes
         mpz_t one;
@@ -820,6 +841,7 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
     
     // Safety check for base_path
     if (!base_path || base_path[0] == '\0') {
+        printf("DEBUG: Invalid base_path\n");
         fprintf(stderr, "Warning: Invalid base_path for binary_split_disk\n");
         // Initialize result with default values to prevent crashes
         mpz_t one;
@@ -835,7 +857,9 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
     }
     
     // If range is small enough, compute in memory then save to disk
+    printf("DEBUG: Range check b-a=%lu, threshold=%zu\n", b-a, memory_threshold);
     if (b - a <= memory_threshold) {
+        printf("DEBUG: Computing in memory\n");
         mpz_t P, Q, T;
         mpz_init(P);
         mpz_init(Q);
@@ -864,38 +888,49 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
     } else {
         // Split the range
         unsigned long m = (a + b) / 2;
+        printf("DEBUG: Splitting range at m=%lu\n", m);
         
         // Create paths for left and right results
         char left_path[MAX_PATH], right_path[MAX_PATH];
         snprintf(left_path, MAX_PATH, "%s/left", base_path);
         snprintf(right_path, MAX_PATH, "%s/right", base_path);
+        printf("DEBUG: left_path=%s, right_path=%s\n", left_path, right_path);
         
         // Create directories
+        printf("DEBUG: Creating directory: %s\n", left_path);
         if (mkdir_recursive(left_path, 0755) != 0) {
             fprintf(stderr, "Warning: Failed to create directory: %s\n", left_path);
         }
         
+        printf("DEBUG: Creating directory: %s\n", right_path);
         if (mkdir_recursive(right_path, 0755) != 0) {
             fprintf(stderr, "Warning: Failed to create directory: %s\n", right_path);
         }
         
         // Compute left and right halves
         chudnovsky_state left_state, right_state;
+        printf("DEBUG: Initializing left_state with path: %s\n", left_path);
         chudnovsky_state_init(&left_state, left_path);
+        printf("DEBUG: Initializing right_state with path: %s\n", right_path);
         chudnovsky_state_init(&right_state, right_path);
         
+        printf("DEBUG: Recursively calling binary_split_disk for left half\n");
         binary_split_disk(&left_state, a, m, left_path, memory_threshold);
+        printf("DEBUG: Recursively calling binary_split_disk for right half\n");
         binary_split_disk(&right_state, m, b, right_path, memory_threshold);
         
         // Create temp paths
         char temp1_path[MAX_PATH], temp2_path[MAX_PATH];
         snprintf(temp1_path, MAX_PATH, "%s/temp1", base_path);
         snprintf(temp2_path, MAX_PATH, "%s/temp2", base_path);
+        printf("DEBUG: temp1_path=%s, temp2_path=%s\n", temp1_path, temp2_path);
         
+        printf("DEBUG: Creating directory: %s\n", temp1_path);
         if (mkdir_recursive(temp1_path, 0755) != 0) {
             fprintf(stderr, "Warning: Failed to create directory: %s\n", temp1_path);
         }
         
+        printf("DEBUG: Creating directory: %s\n", temp2_path);
         if (mkdir_recursive(temp2_path, 0755) != 0) {
             fprintf(stderr, "Warning: Failed to create directory: %s\n", temp2_path);
         }
@@ -1702,103 +1737,129 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     if (state->digits <= 1000) {
         printf("Using simplified in-memory approach for small digit count...\n");
         
+        // Constants from Chudnovsky algorithm
+        const int D = 12;  // Missing from the original implementation
+
         // Use MPFR for direct Chudnovsky formula calculation
-        mpfr_t pi, sum, term;
+        mpfr_t pi, p, q, temp_sqrt, temp_div;
         mpfr_prec_t precision = (mpfr_prec_t)(state->digits * 4);
         
+        // Initialize MPFR variables
         mpfr_init2(pi, precision);
-        mpfr_init2(sum, precision);
-        mpfr_init2(term, precision);
+        mpfr_init2(p, precision);    // 'p' accumulator
+        mpfr_init2(q, precision);    // 'q' accumulator
+        mpfr_init2(temp_sqrt, precision);
+        mpfr_init2(temp_div, precision);
         
-        // Constants
+        // Initialize constants
         mpfr_t c, c3_over_24;
         mpfr_init2(c, precision);
         mpfr_init2(c3_over_24, precision);
         
+        // Set constant values
         mpfr_set_ui(c, C, MPFR_RNDN);
         mpfr_set_str(c3_over_24, C3_OVER_24_STR, 10, MPFR_RNDN);
         
-        // Calculate pi directly using the Chudnovsky formula
-        mpfr_set_ui(sum, 0, MPFR_RNDN);
+        // Initialize accumulators
+        mpfr_set_ui(p, 0, MPFR_RNDN);  // This is our 'p' accumulator
+        mpfr_set_ui(q, 0, MPFR_RNDN);  // This is our 'q' accumulator
         
         // Calculate enough terms for the desired precision
         int terms = (int)ceil(state->digits / 14.0) + 1;
+        printf("Will compute %d terms\n", terms);
+        
         for (int k = 0; k < terms; k++) {
-            // Calculate (6k)! / ((3k)! * (k!)^3)
-            mpfr_t fact_num, fact_denom;
-            mpfr_init2(fact_num, precision);
-            mpfr_init2(fact_denom, precision);
+            int b = k + 1;  // In Chudnovsky's formula, we use 1-based indexing
             
-            // (6k)!
-            mpfr_fac_ui(fact_num, 6 * k, MPFR_RNDN);
+            // Following the gmp-chudnovsky.c implementation
+            // For each term, we compute:
+            // - p_term = b^3 * C^3 / 24
+            // - g_term = (6b-5)(2b-1)(6b-1)
+            // - q_term = (-1)^b * g_term * (A + B*b)
             
-            // (3k)!
-            mpfr_fac_ui(fact_denom, 3 * k, MPFR_RNDN);
+            mpfr_t p_term, g_term, q_term;
+            mpfr_init2(p_term, precision);
+            mpfr_init2(g_term, precision);
+            mpfr_init2(q_term, precision);
             
-            // (k!)^3
-            mpfr_t k_fact;
-            mpfr_init2(k_fact, precision);
-            mpfr_fac_ui(k_fact, k, MPFR_RNDN);
-            mpfr_pow_ui(k_fact, k_fact, 3, MPFR_RNDN);
+            // Compute p_term = b^3 * C^3 / 24
+            mpfr_set_ui(p_term, b, MPFR_RNDN);
+            mpfr_pow_ui(p_term, p_term, 3, MPFR_RNDN);  // b^3
+            mpfr_mul(p_term, p_term, c3_over_24, MPFR_RNDN);  // b^3 * C^3 / 24
             
-            // (3k)! * (k!)^3
-            mpfr_mul(fact_denom, fact_denom, k_fact, MPFR_RNDN);
+            // Compute g_term = (6b-5)(2b-1)(6b-1)
+            mpfr_set_ui(g_term, 2*b-1, MPFR_RNDN);  // 2b-1
+            mpfr_mul_ui(g_term, g_term, 6*b-1, MPFR_RNDN);  // (2b-1)(6b-1)
+            mpfr_mul_ui(g_term, g_term, 6*b-5, MPFR_RNDN);  // (6b-5)(2b-1)(6b-1)
             
-            // (6k)! / ((3k)! * (k!)^3)
-            mpfr_div(term, fact_num, fact_denom, MPFR_RNDN);
-            
-            // Multiply by (A + Bk)
-            mpfr_t ak;
-            mpfr_init2(ak, precision);
-            mpfr_set_ui(ak, B, MPFR_RNDN);
-            mpfr_mul_ui(ak, ak, k, MPFR_RNDN);
-            mpfr_add_ui(ak, ak, A, MPFR_RNDN);
-            mpfr_mul(term, term, ak, MPFR_RNDN);
-            
-            // Divide by C^(3k)
-            mpfr_t c_pow;
-            mpfr_init2(c_pow, precision);
-            mpfr_pow_ui(c_pow, c, 3 * k, MPFR_RNDN);
-            mpfr_div(term, term, c_pow, MPFR_RNDN);
-            
-            // Alternate sign
-            if (k % 2 == 1) {
-                mpfr_neg(term, term, MPFR_RNDN);
+            // Compute q_term = (-1)^b * g_term * (A + B*b)
+            mpfr_set_ui(q_term, b, MPFR_RNDN);
+            mpfr_mul_ui(q_term, q_term, B, MPFR_RNDN);  // B*b
+            mpfr_add_ui(q_term, q_term, A, MPFR_RNDN);  // A + B*b
+            mpfr_mul(q_term, q_term, g_term, MPFR_RNDN);  // g_term * (A + B*b)
+            if (b % 2 == 1) {  // If b is odd, negate
+                mpfr_neg(q_term, q_term, MPFR_RNDN);
             }
             
-            // Add to sum
-            mpfr_add(sum, sum, term, MPFR_RNDN);
+            // Update p and q accumulators
+            mpfr_add(p, p, p_term, MPFR_RNDN);  // p += p_term
+            mpfr_add(q, q, q_term, MPFR_RNDN);  // q += q_term
             
-            // Clean up
-            mpfr_clear(fact_num);
-            mpfr_clear(fact_denom);
-            mpfr_clear(k_fact);
-            mpfr_clear(ak);
-            mpfr_clear(c_pow);
+            // Clean up terms
+            mpfr_clear(p_term);
+            mpfr_clear(g_term);
+            mpfr_clear(q_term);
         }
         
-        // Multiply by 12
-        mpfr_mul_ui(sum, sum, 12, MPFR_RNDN);
+        // Using the Chudnovsky formula: pi = (C/D) * p * sqrt(C) / (A*p + q)
         
-        // Reciprocal
-        mpfr_ui_div(pi, 1, sum, MPFR_RNDN);
+        // Compute A*p + q
+        mpfr_mul_ui(temp_div, p, A, MPFR_RNDN);  // temp_div = A*p
+        mpfr_add(temp_div, temp_div, q, MPFR_RNDN);  // temp_div = A*p + q
         
-        // Debug output
+        // Compute p * (C/D)
+        mpfr_mul_ui(p, p, C/D, MPFR_RNDN);  // p = p * (C/D)
+        
+        // Calculate sqrt(C)
+        mpfr_sqrt_ui(temp_sqrt, C, MPFR_RNDN);  // temp_sqrt = sqrt(C)
+        
+        // Multiply: p = p * sqrt(C)
+        mpfr_mul(p, p, temp_sqrt, MPFR_RNDN);  // p = p * sqrt(C)
+        
+        // Final division: pi = p / temp_div
+        mpfr_div(pi, p, temp_div, MPFR_RNDN);  // pi = p / temp_div
+        
+        // Print final value for verification
         mpfr_printf("Final pi value: %.10Rf\n", pi);
         
         // Write the result to file
         FILE* f = fopen(state->output_file, "w");
         if (f) {
-            char *str_pi = mpfr_get_str(NULL, NULL, 10, state->digits + 2, pi, MPFR_RNDN);
-            fprintf(f, "3.%s", str_pi + 1);  // Skip first digit and add decimal point
-            mpfr_free_str(str_pi);
+            // Get pi as a string
+            mpfr_exp_t exp;
+            char *str_pi = mpfr_get_str(NULL, &exp, 10, state->digits + 2, pi, MPFR_RNDN);
+            
+            if (str_pi != NULL) {
+                // Format correctly with the right exponent (should be 1 for pi)
+                if (exp == 1) {
+                    fprintf(f, "%c.%s", str_pi[0], str_pi + 1);  // Standard 3.14159... format
+                } else {
+                    // Fall back to standard format if something unusual happened with the exponent
+                    fprintf(f, "%c.%s", str_pi[0], str_pi + 1);
+                }
+                mpfr_free_str(str_pi);
+            } else {
+                fprintf(f, "ERROR: Pi calculation failed");
+            }
             fclose(f);
         }
         
-        // Clean up
+        // Clean up MPFR variables
         mpfr_clear(pi);
-        mpfr_clear(sum);
-        mpfr_clear(term);
+        mpfr_clear(p);
+        mpfr_clear(q);
+        mpfr_clear(temp_sqrt);
+        mpfr_clear(temp_div);
         mpfr_clear(c);
         mpfr_clear(c3_over_24);
         
@@ -1807,14 +1868,17 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     }
     
     // For larger digit counts, use the full disk-based approach
+    printf("DEBUG: Using full disk-based approach\n");
     
     // Create working directories
     char split_path[MAX_PATH];
+    printf("DEBUG: Joining paths: %s + 'split'\n", state->work_dir);
     if (safe_path_join(split_path, MAX_PATH, state->work_dir, "split") < 0) {
         fprintf(stderr, "Error: Path too long for split directory\n");
         return;  // Return early on error
     }
     
+    printf("DEBUG: Split path is: %s\n", split_path);
     if (mkdir_recursive(split_path, 0755) != 0) {
         fprintf(stderr, "Error: Failed to create split directory\n");
         return;  // Return early on error
@@ -1822,6 +1886,7 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     
     // Determine memory threshold based on available memory
     size_t memory_threshold = 1000;  // Default
+    printf("DEBUG: Memory threshold set to %zu\n", memory_threshold);
     
     // Adjust threshold based on size of calculation
     if (state->terms > 1000000) {
@@ -1835,8 +1900,10 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     }
     
     // Perform binary splitting
+    printf("DEBUG: Pool has %d threads\n", pool->num_threads);
     if (pool->num_threads <= 1) {
         // Single-threaded approach
+        printf("DEBUG: Using single-threaded approach, terms: %lu\n", state->terms);
         binary_split_disk(&state->data.chudnovsky, 0, state->terms, split_path, memory_threshold);
     } else {
         // Multi-threaded approach
@@ -3373,6 +3440,9 @@ void run_cli_mode(int argc, char** argv) {
 // ==========================================================================
 
 int main(int argc, char** argv) {
+    // Install signal handler for segmentation fault
+    signal(SIGSEGV, segfault_handler);
+    printf("DEBUG: Installed segfault handler\n");
     // Set up signal handlers
     signal(SIGINT, handle_sigint);
     signal(SIGHUP, handle_sighup);
