@@ -188,12 +188,41 @@ typedef enum {
     LOG_OUTPUT_FILE
 } log_output_t;
 
-// Signal handler for segmentation faults
+// Flag to indicate a segmentation fault has occurred
+volatile sig_atomic_t g_segfault_occurred = 0;
+// Path where crash log should be written
+char g_crash_log_path[MAX_PATH];
+
+// Async-signal safe handler for segmentation faults
 void segfault_handler(int sig) {
+    // Set the global flag to indicate the crash
+    g_segfault_occurred = 1;
+    
+    // Generate a timestamp-based filename for the crash log
+    // We'll use a static filename since we can't use sprintf in signal handlers
+    const char *crash_file = "pi_calculator_crash.log";
+    
+    // Store the path for the monitoring thread to use
+    int i;
+    for (i = 0; i < MAX_PATH - 1 && crash_file[i] != '\0'; i++) {
+        g_crash_log_path[i] = crash_file[i];
+    }
+    g_crash_log_path[i] = '\0';
+    
+    // Write a minimal message to stderr using only async-signal safe functions
+    const char *msg = "CRITICAL: Caught segmentation fault. Terminating process.\n";
+    write(STDERR_FILENO, msg, strlen(msg));
+    
+    // Use _exit() instead of exit() to avoid calling atexit handlers which might cause another crash
+    // This is async-signal safe
+    _exit(1);
+}
+
+// Non-signal function that can be called by a monitoring thread to perform thorough crash logging
+void perform_crash_logging(const char *crash_log_path) {
     char buf[256];
     time_t now;
     struct tm *tm_info;
-    char crash_log_path[MAX_PATH];
     FILE *crash_log = NULL;
     
     // Get current time for the log
@@ -202,13 +231,12 @@ void segfault_handler(int sig) {
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
     
     // Create a crash log file
-    snprintf(crash_log_path, sizeof(crash_log_path), "pi_calculator_crash_%ld.log", (long)now);
     crash_log = fopen(crash_log_path, "w");
     
     // Log to stderr and crash file if available
-    fprintf(stderr, "[%s] CRITICAL: Caught signal %d (segmentation fault)\n", buf, sig);
+    fprintf(stderr, "[%s] CRITICAL: Caught signal (segmentation fault)\n", buf);
     if (crash_log) {
-        fprintf(crash_log, "[%s] CRITICAL: Caught signal %d (segmentation fault)\n", buf, sig);
+        fprintf(crash_log, "[%s] CRITICAL: Caught signal (segmentation fault)\n", buf);
     }
     
     // Process info
@@ -353,10 +381,6 @@ void segfault_handler(int sig) {
         fclose(crash_log);
         fprintf(stderr, "Crash information saved to %s\n", crash_log_path);
     }
-    
-    // Use _exit() instead of exit() to avoid calling atexit handlers which might cause another crash
-    fprintf(stderr, "Terminating process due to segmentation fault\n");
-    _exit(1);
 }
 
 // Structure definition for timeout monitor thread data
@@ -1147,7 +1171,7 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
     bool temp1_initialized = false;
     bool temp2_initialized = false;
     
-    if (config.logging.level <= LOG_LEVEL_DEBUG) {
+    if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
         printf("DEBUG: binary_split_disk a=%lu, b=%lu, base_path=%s\n", a, b, base_path ? base_path : "NULL");
     }
     
@@ -1184,12 +1208,12 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
     }
     
     // If range is small enough, compute in memory then save to disk
-    if (config.logging.level <= LOG_LEVEL_DEBUG) {
+    if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
         printf("DEBUG: Range check b-a=%lu, threshold=%zu\n", b-a, memory_threshold);
     }
     
     if (b - a <= memory_threshold) {
-        if (config.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Computing in memory\n");
         }
         
@@ -1201,7 +1225,7 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
         binary_split_mpz(P, Q, T, a, b);
         
         // Debug output for small ranges
-        if (b - a < 5 && config.logging.level <= LOG_LEVEL_DEBUG) {
+        if (b - a < 5 && config.logging.logging.level <= LOG_LEVEL_DEBUG) {
             char *p_str = mpz_get_str(NULL, 10, P);
             char *q_str = mpz_get_str(NULL, 10, Q);
             char *t_str = mpz_get_str(NULL, 10, T);
@@ -1223,19 +1247,19 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
     } else {
         // Split the range
         unsigned long m = (a + b) / 2;
-        if (config.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Splitting range at m=%lu\n", m);
         }
         
         // Create paths for left and right results
         snprintf(left_path, MAX_PATH, "%s/left", base_path);
         snprintf(right_path, MAX_PATH, "%s/right", base_path);
-        if (config.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: left_path=%s, right_path=%s\n", left_path, right_path);
         }
         
         // Create directories with error checking
-        if (config.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Creating directory: %s\n", left_path);
         }
         
@@ -1247,7 +1271,7 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
             goto cleanup;
         }
         
-        if (config.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Creating directory: %s\n", right_path);
         }
         
@@ -1261,27 +1285,27 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
         
         // Compute left and right halves
         chudnovsky_state left_state, right_state;
-        if (config.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Initializing left_state with path: %s\n", left_path);
         }
         
         chudnovsky_state_init(&left_state, left_path);
         left_state_initialized = true;
         
-        if (config.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Initializing right_state with path: %s\n", right_path);
         }
         
         chudnovsky_state_init(&right_state, right_path);
         right_state_initialized = true;
         
-        if (config.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Recursively calling binary_split_disk for left half\n");
         }
         
         binary_split_disk(&left_state, a, m, left_path, memory_threshold);
         
-        if (config.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Recursively calling binary_split_disk for right half\n");
         }
         
@@ -1290,11 +1314,11 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
         // Create temp paths
         snprintf(temp1_path, MAX_PATH, "%s/temp1", base_path);
         snprintf(temp2_path, MAX_PATH, "%s/temp2", base_path);
-        if (config.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: temp1_path=%s, temp2_path=%s\n", temp1_path, temp2_path);
         }
         
-        if (config.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Creating directory: %s\n", temp1_path);
         }
         
@@ -1306,7 +1330,7 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
             goto cleanup;
         }
         
-        if (config.logging.level <= LOG_LEVEL_DEBUG) {
+        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
             printf("DEBUG: Creating directory: %s\n", temp2_path);
         }
         
@@ -1773,13 +1797,12 @@ int http_queue_size() {
 void http_enqueue_job(int client_sock) {
     pthread_mutex_lock(&http_queue_lock);
     
-    // Check if the queue is full
-    int queue_full = ((http_queue_back + 1) % MAX_HTTP_QUEUE_SIZE == http_queue_front);
-    
-    if (queue_full) {
-        fprintf(stderr, "Error: HTTP job queue is full, cannot enqueue socket %d\n", client_sock);
-        pthread_mutex_unlock(&http_queue_lock);
-        return;
+    // Check if the queue is full, wait if necessary
+    while ((http_queue_back + 1) % MAX_HTTP_QUEUE_SIZE == http_queue_front) {
+        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+            fprintf(stderr, "Debug: HTTP job queue is full, waiting for space\n");
+        }
+        pthread_cond_wait(&http_queue_not_full, &http_queue_lock);
     }
     
     // Add the client socket to the queue
@@ -1798,7 +1821,7 @@ void http_enqueue_job(int client_sock) {
     pthread_cond_signal(&http_queue_not_empty);
     
     // Log the queue operation
-    if (config.logging.level <= LOG_LEVEL_DEBUG) {
+    if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
         fprintf(stderr, "Debug: Enqueued socket %d, queue size now %d\n", 
                 client_sock, http_queue_size());
     }
@@ -1810,11 +1833,18 @@ void http_enqueue_job(int client_sock) {
 int http_dequeue_job() {
     pthread_mutex_lock(&http_queue_lock);
     
-    // Check if the queue is empty
-    if (http_queue_front == http_queue_back) {
-        fprintf(stderr, "Error: Attempting to dequeue from an empty HTTP job queue\n");
-        pthread_mutex_unlock(&http_queue_lock);
-        return -1;  // Return invalid socket to indicate error
+    // Check if the queue is empty, wait if necessary
+    while (http_queue_front == http_queue_back) {
+        if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
+            fprintf(stderr, "Debug: HTTP job queue is empty, waiting for job\n");
+        }
+        pthread_cond_wait(&http_queue_not_empty, &http_queue_lock);
+        
+        // If we're shutting down and still empty after waiting, return error
+        if (http_queue_front == http_queue_back) {
+            pthread_mutex_unlock(&http_queue_lock);
+            return -1;
+        }
     }
     
     // Dequeue client socket
@@ -1833,7 +1863,7 @@ int http_dequeue_job() {
     pthread_cond_signal(&http_queue_not_full);
     
     // Log the queue operation
-    if (config.logging.level <= LOG_LEVEL_DEBUG) {
+    if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
         fprintf(stderr, "Debug: Dequeued socket %d, queue size now %d\n", 
                 client_sock, http_queue_size());
     }
@@ -1856,36 +1886,13 @@ void* http_worker_function(void* arg) {
             break;  // Exit if shutting down
         }
         
-        int client_sock;
-        int attempts = 0;
-        int max_attempts = 5;
+        // Get a job from the queue - http_dequeue_job now handles waiting via condition variable
+        int client_sock = http_dequeue_job();
         
-        // Try to get a job from the queue
-        while (attempts < max_attempts) {
-            // Now http_dequeue_job does its own locking
-            client_sock = http_dequeue_job();
-            
-            if (client_sock >= 0) {
-                // Successfully dequeued a job
-                break;
-            }
-            
-            // Failed to get a job, queue might be empty
-            attempts++;
-            usleep(100000 * attempts);  // Exponential backoff
-            
-            // Check shutdown flag during backoff to allow faster shutdown
-            if (pool->shutdown) {
-                return NULL;
-            }
+        if (client_sock >= 0) {
+            // Handle the HTTP request
+            handle_http_request(&client_sock);
         }
-        
-        if (attempts == max_attempts) {
-            continue;  // No job found after multiple attempts
-        }
-        
-        // Handle the HTTP request
-        handle_http_request(&client_sock);
     }
     
     return NULL;
@@ -2954,6 +2961,7 @@ void set_default_config() {
     // Logging settings
     strncpy(config.logging_level, "info", sizeof(config.logging_level));
     strncpy(config.logging_output, "console", sizeof(config.logging_output));
+    config.logging.logging.level = LOG_LEVEL_INFO; // Set default integer level
     
     // Directory settings
     strncpy(config.work_dir, "./pi_calc", sizeof(config.work_dir));
@@ -3047,7 +3055,11 @@ bool load_config_from_file(const char* config_file) {
         
         if (json_object_object_get_ex(j_logging, "level", &j_level)) {
             const char* level = json_object_get_string(j_level);
-            if (level) strncpy(config.logging_level, level, sizeof(config.logging_level));
+            if (level) {
+                strncpy(config.logging_level, level, sizeof(config.logging_level));
+                // Also set the integer value
+                config.logging.logging.level = convert_log_level_string_to_int(level);
+            }
         }
         
         if (json_object_object_get_ex(j_logging, "output", &j_output)) {
@@ -3074,6 +3086,22 @@ bool load_config_from_file(const char* config_file) {
     
     json_object_put(parsed_json);
     return true;
+}
+
+// Convert string log level to integer log level
+int convert_log_level_string_to_int(const char* level) {
+    if (!level) return LOG_LEVEL_INFO; // Default
+
+    if (strcasecmp(level, "debug") == 0) {
+        return LOG_LEVEL_DEBUG;
+    } else if (strcasecmp(level, "info") == 0) {
+        return LOG_LEVEL_INFO;
+    } else if (strcasecmp(level, "error") == 0) {
+        return LOG_LEVEL_ERROR;
+    }
+    
+    // Default to INFO if unknown
+    return LOG_LEVEL_INFO;
 }
 
 // Override configuration with command line arguments
@@ -3114,6 +3142,9 @@ void override_config_with_args(int argc, char** argv) {
                 break;
         }
     }
+    
+    // Make sure the string log level is converted to its integer equivalent
+    config.logging.logging.level = convert_log_level_string_to_int(config.logging_level);
     
     // If non-option arguments exist and in server mode, switch to CLI mode
     if (optind < argc && config.mode == MODE_SERVER) {
@@ -3432,10 +3463,19 @@ void* calculation_thread_func(void* arg) {
     state_initialized = true;
     state.checkpointing_enabled = checkpointing_enabled;
     
-    // Create calculation thread pool
-    calc_thread_pool_init(&pool, config.max_calc_threads);
-    pool_initialized = true;
-    calc_thread_pool_start(&pool);
+    // Use the global calculation thread pool instead of creating a local one
+    if (!g_calc_pool) {
+        fprintf(stderr, "Error: Global calculation thread pool is not initialized\n");
+        pthread_mutex_lock(&jobs[job_idx].lock);
+        jobs[job_idx].status = JOB_STATUS_FAILED;
+        strncpy(jobs[job_idx].error_message, "Global calculation thread pool not initialized", 
+                sizeof(jobs[job_idx].error_message)-1);
+        jobs[job_idx].error_message[sizeof(jobs[job_idx].error_message)-1] = '\0';
+        pthread_mutex_unlock(&jobs[job_idx].lock);
+        result = -1;
+        goto cleanup;
+    }
+    pool_initialized = false; // We're using the global pool, not initializing our own
     
     // Update job status
     update_job_status(job_idx, JOB_STATUS_RUNNING, 0.0, NULL);
@@ -3473,7 +3513,7 @@ void* calculation_thread_func(void* arg) {
     if (algorithm == ALGO_GAUSS_LEGENDRE) {
         calculate_pi_gauss_legendre(&state);
     } else {
-        calculate_pi_chudnovsky(&state, &pool);
+        calculate_pi_chudnovsky(&state, g_calc_pool);
     }
     
     // Check if calculation timed out
@@ -3499,9 +3539,7 @@ cleanup:
     }
     
     // Clean up resources in reverse order of allocation
-    if (pool_initialized) {
-        calc_thread_pool_shutdown(&pool);
-    }
+    // We're using the global pool, so no need to shut down our own pool
     
     if (state_initialized) {
         calculation_state_clear(&state);
@@ -3593,20 +3631,20 @@ void handle_calculation_request(int client_sock, const char* algo_str, const cha
         calculation_state_init(&state, digits, algorithm, use_out_of_core, work_dir, -1);
         state.checkpointing_enabled = checkpointing_enabled;
         
-        // Create calculation thread pool
-        calc_thread_pool pool;
-        calc_thread_pool_init(&pool, config.max_calc_threads);
-        calc_thread_pool_start(&pool);
+        // Use the global calculation thread pool, not a local one
+        if (!g_calc_pool) {
+            fprintf(stderr, "Error: Global calculation thread pool is not initialized\n");
+            return NULL;
+        }
         
         // Perform calculation
         if (algorithm == ALGO_GAUSS_LEGENDRE) {
             calculate_pi_gauss_legendre(&state);
         } else {
-            calculate_pi_chudnovsky(&state, &pool);
+            calculate_pi_chudnovsky(&state, g_calc_pool);
         }
         
-        // Clean up thread pool
-        calc_thread_pool_shutdown(&pool);
+        // No need to clean up the global thread pool
         
         // Measure time
         clock_t end_time = clock();
@@ -4394,15 +4432,23 @@ void run_server_mode() {
     
     // Initialize thread pools
     http_thread_pool http_pool;
-    calc_thread_pool calc_pool;
+    // We'll use the global calc thread pool
     
     http_thread_pool_init(&http_pool, config.max_http_threads);
-    calc_thread_pool_init(&calc_pool, config.max_calc_threads);
-    calc_thread_pool_start(&calc_pool);
+    // Initialize the global calc thread pool
+    g_calc_pool = (calc_thread_pool*)malloc(sizeof(calc_thread_pool));
+    if (!g_calc_pool) {
+        fprintf(stderr, "Failed to allocate memory for calculation thread pool\n");
+        close(server_socket);
+        http_thread_pool_shutdown(&http_pool);
+        return 1;
+    }
+    calc_thread_pool_init(g_calc_pool, config.max_calc_threads);
+    calc_thread_pool_start(g_calc_pool);
     
-    // Store in global variables for signal handling
+    // Store HTTP pool in global variable for signal handling
     g_http_pool = &http_pool;
-    g_calc_pool = &calc_pool;
+    // g_calc_pool is already set
     
     // Log server start
     char log_buf[BUFFER_SIZE];
@@ -4411,6 +4457,11 @@ void run_server_mode() {
     
     // Main server loop
     while (!g_shutdown_flag) {
+        if (g_segfault_occurred) {
+            perform_crash_logging(g_crash_log_path);
+            // Consider more cleanup or just exit
+            _exit(2); // Different exit code for crash
+        }
         // Wait for connections with timeout to check shutdown flag periodically
         fd_set read_fds;
         FD_ZERO(&read_fds);
@@ -4451,7 +4502,7 @@ void run_server_mode() {
                 // Signal a worker thread that there's a new job
                 sem_post(http_pool.job_semaphore);
                 
-                if (config.logging.level <= LOG_LEVEL_DEBUG) {
+                if (config.logging.logging.level <= LOG_LEVEL_DEBUG) {
                     char client_ip[INET_ADDRSTRLEN];
                     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
                     fprintf(stderr, "Debug: Accepted connection from %s:%d\n",
@@ -4470,10 +4521,15 @@ void run_server_mode() {
     
     // Clean up (this should be handled by the signal handler)
     http_thread_pool_shutdown(&http_pool);
-    calc_thread_pool_shutdown(&calc_pool);
+    // Clean up the global calculation thread pool
+    if (g_calc_pool) {
+        calc_thread_pool_shutdown(g_calc_pool);
+        free(g_calc_pool);
+        g_calc_pool = NULL;
+    }
     
     g_http_pool = NULL;
-    g_calc_pool = NULL;
+    // g_calc_pool is already set to NULL above
     
     // Close server socket
     if (g_server_sock != -1) {
@@ -4523,6 +4579,11 @@ void run_cli_mode(int argc, char** argv) {
     
     // Print completion message
     printf("Calculation complete! Result saved to %s\n", state.output_file);
+
+    if (g_segfault_occurred) {
+        perform_crash_logging(g_crash_log_path);
+        _exit(2);
+    }
     
     // Clean up
     calculation_state_clear(&state);
