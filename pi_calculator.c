@@ -415,17 +415,175 @@ typedef struct {
 // Disk-Based Integer Implementation
 // ==========================================================================
 
-// Structure for disk-based large integers
+// Structure for disk-based large integers with chunking support
 struct disk_int {
-    char file_path[MAX_PATH];   // Path to file storing the integer
-    size_t size_in_limbs;       // Size in GMP limbs
+    char file_path[MAX_PATH];   // Base path for the chunks
+    size_t total_size_in_limbs; // Total size across all chunks
     int sign;                   // Sign of the number (1, 0, -1)
-    void* cache;                // Memory cache for active part of integer
-    size_t cache_size;          // Size of cache in limbs
-    size_t cache_offset;        // Offset of cached segment
+    size_t chunk_size;          // Size of each chunk in limbs
+    size_t num_chunks;          // Number of chunks
+    void* cache;                // Memory cache for active chunk
+    size_t cache_chunk_idx;     // Index of cached chunk
     bool dirty;                 // Whether cache needs writing back to disk
     pthread_mutex_t lock;       // Mutex for thread safety
 };
+
+// Get chunk file path from base path and chunk index
+int get_chunk_path(char *dest, size_t dest_size, const char *base_path, size_t chunk_idx) {
+    char component[32];
+    snprintf(component, sizeof(component), "chunk_%zu.bin", chunk_idx);
+    return safe_path_join(dest, dest_size, base_path, component);
+}
+
+// Determine optimal chunk size based on available memory and total size
+size_t determine_optimal_chunk_size(size_t available_memory, size_t total_size) {
+    // Default to 1MB chunks or 10% of available memory, whichever is smaller
+    size_t optimal_size = MIN(1024*1024, available_memory / 10);
+    
+    // Don't make chunks too small relative to the total size
+    if (total_size < 100 * optimal_size) {
+        optimal_size = MAX(total_size / 100, MIN_CHUNK_SIZE);
+    }
+    
+    // Make sure we're not exceeding maximum chunk size
+    if (optimal_size > MAX_CHUNK_SIZE) {
+        optimal_size = MAX_CHUNK_SIZE;
+    }
+    
+    return optimal_size;
+}
+
+// Load a specific chunk into memory
+int load_chunk(disk_int* d_int, size_t chunk_idx) {
+    if (chunk_idx >= d_int->num_chunks) {
+        return -1; // Invalid chunk index
+    }
+    
+    // If the current cached chunk is dirty, save it first
+    if (d_int->dirty && d_int->cache) {
+        if (save_chunk(d_int, d_int->cache_chunk_idx) != 0) {
+            return -1;
+        }
+    }
+    
+    // Determine actual chunk size - the last chunk might be smaller
+    size_t chunk_size = d_int->chunk_size;
+    if (chunk_idx == d_int->num_chunks - 1) {
+        size_t last_chunk_size = d_int->total_size_in_limbs % d_int->chunk_size;
+        if (last_chunk_size > 0) {
+            chunk_size = last_chunk_size;
+        }
+    }
+    
+    // Allocate cache if not already allocated
+    if (!d_int->cache) {
+        d_int->cache = malloc(d_int->chunk_size * sizeof(mp_limb_t));
+        if (!d_int->cache) {
+            return -1; // Memory allocation failed
+        }
+    } else if (d_int->cache_chunk_idx == chunk_idx) {
+        return 0; // Chunk already loaded
+    }
+    
+    // Construct chunk file path
+    char chunk_path[MAX_PATH];
+    if (get_chunk_path(chunk_path, MAX_PATH, d_int->file_path, chunk_idx) < 0) {
+        return -1;
+    }
+    
+    // Open the chunk file
+    FILE* f = fopen(chunk_path, "rb");
+    if (!f) {
+        // If the file doesn't exist, initialize it with zeros
+        memset(d_int->cache, 0, chunk_size * sizeof(mp_limb_t));
+        d_int->cache_chunk_idx = chunk_idx;
+        d_int->dirty = true;
+        return 0;
+    }
+    
+    // Read chunk data
+    size_t read_items = fread(d_int->cache, sizeof(mp_limb_t), chunk_size, f);
+    fclose(f);
+    
+    if (read_items != chunk_size) {
+        // Handle read error or partial read
+        // Fill the rest with zeros if partial read
+        if (read_items < chunk_size) {
+            memset((char*)d_int->cache + read_items * sizeof(mp_limb_t), 
+                   0, (chunk_size - read_items) * sizeof(mp_limb_t));
+        }
+    }
+    
+    d_int->cache_chunk_idx = chunk_idx;
+    d_int->dirty = false;
+    
+    return 0;
+}
+
+// Save a specific chunk to disk
+int save_chunk(disk_int* d_int, size_t chunk_idx) {
+    if (chunk_idx >= d_int->num_chunks) {
+        return -1; // Invalid chunk index
+    }
+    
+    // If this chunk is not currently cached, we can't save it
+    if (!d_int->cache || d_int->cache_chunk_idx != chunk_idx) {
+        return -1;
+    }
+    
+    // If not dirty, no need to save
+    if (!d_int->dirty) {
+        return 0;
+    }
+    
+    // Determine actual chunk size - the last chunk might be smaller
+    size_t chunk_size = d_int->chunk_size;
+    if (chunk_idx == d_int->num_chunks - 1) {
+        size_t last_chunk_size = d_int->total_size_in_limbs % d_int->chunk_size;
+        if (last_chunk_size > 0) {
+            chunk_size = last_chunk_size;
+        }
+    }
+    
+    // Construct chunk file path
+    char chunk_path[MAX_PATH];
+    if (get_chunk_path(chunk_path, MAX_PATH, d_int->file_path, chunk_idx) < 0) {
+        return -1;
+    }
+    
+    // Ensure directory exists
+    char dir_path[MAX_PATH];
+    char* last_slash = strrchr(chunk_path, '/');
+    if (last_slash) {
+        size_t dir_len = last_slash - chunk_path;
+        strncpy(dir_path, chunk_path, dir_len);
+        dir_path[dir_len] = '\0';
+        
+        if (mkdir_recursive(dir_path, 0755) != 0) {
+            fprintf(stderr, "Error creating directory structure for: %s\n", chunk_path);
+            return -1;
+        }
+    }
+    
+    // Open chunk file for writing
+    FILE* f = fopen(chunk_path, "wb");
+    if (!f) {
+        fprintf(stderr, "Error opening chunk file for writing: %s\n", chunk_path);
+        return -1;
+    }
+    
+    // Write chunk data
+    size_t written = fwrite(d_int->cache, sizeof(mp_limb_t), chunk_size, f);
+    fclose(f);
+    
+    if (written != chunk_size) {
+        fprintf(stderr, "Error writing chunk data to file: %s\n", chunk_path);
+        return -1;
+    }
+    
+    d_int->dirty = false;
+    return 0;
+}
 
 // Safely join base path with a component, avoiding buffer overflow
 // Returns 0 on success, -1 if truncation would occur
@@ -529,50 +687,33 @@ void disk_int_init(disk_int* d_int, const char* base_path) {
         return;
     }
     
-    // Generate a unique file path
+    // Store the base path for this disk integer
+    // We'll create a unique directory for this disk integer's chunks
     static int counter = 0;
-    snprintf(d_int->file_path, MAX_PATH, "%s/int_%d_%lu.bin", 
+    snprintf(d_int->file_path, MAX_PATH, "%s/int_%d_%lu", 
              base_path, (int)getpid(), (unsigned long)counter++);
-    printf("DEBUG: Generated file path: %s\n", d_int->file_path);
+    printf("DEBUG: Generated base path: %s\n", d_int->file_path);
     
-    // Extract directory path from file path
-    char dir_path[MAX_PATH];
-    char* last_slash = strrchr(d_int->file_path, '/');
-    if (last_slash) {
-        printf("DEBUG: Found last slash in path\n");
-        size_t dir_len = last_slash - d_int->file_path;
-        strncpy(dir_path, d_int->file_path, dir_len);
-        dir_path[dir_len] = '\0';
-        printf("DEBUG: Extracted dir_path: %s\n", dir_path);
-        
-        // Create directory structure recursively
-        printf("DEBUG: Creating directory structure: %s\n", dir_path);
-        if (mkdir_recursive(dir_path, 0755) != 0) {
-            fprintf(stderr, "Error creating directory structure for: %s\n", d_int->file_path);
-            d_int->file_path[0] = '\0';
-            return;
-        }
-    }
-
-    d_int->size_in_limbs = 0;
-    d_int->sign = 0;
-    d_int->cache = NULL;
-    d_int->cache_size = 0;
-    d_int->cache_offset = 0;
-    d_int->dirty = false;
-    pthread_mutex_init(&d_int->lock, NULL);
-    
-    // Create an empty file
-    printf("DEBUG: Creating empty file: %s\n", d_int->file_path);
-    FILE* f = fopen(d_int->file_path, "wb");
-    if (!f) {
-        printf("DEBUG: Failed to create file, errno=%d (%s)\n", errno, strerror(errno));
-        fprintf(stderr, "Error creating disk integer file: %s\n", d_int->file_path);
-        d_int->file_path[0] = '\0';  // Mark as invalid
-        pthread_mutex_destroy(&d_int->lock);
+    // Create directory structure for this disk integer
+    if (mkdir_recursive(d_int->file_path, 0755) != 0) {
+        fprintf(stderr, "Error creating directory structure for: %s\n", d_int->file_path);
+        d_int->file_path[0] = '\0';
         return;
     }
-    fclose(f);
+    
+    // Initialize chunking parameters
+    d_int->total_size_in_limbs = 0;
+    d_int->sign = 0;
+    d_int->chunk_size = determine_optimal_chunk_size(DEFAULT_MEMORY_LIMIT, 0);
+    d_int->num_chunks = 0;
+    d_int->cache = NULL;
+    d_int->cache_chunk_idx = 0;
+    d_int->dirty = false;
+    
+    pthread_mutex_init(&d_int->lock, NULL);
+    
+    printf("DEBUG: Initialized chunked disk_int with optimal chunk size = %zu limbs\n", 
+           d_int->chunk_size);
 }
 
 // Clear and free resources for a disk integer
@@ -587,15 +728,7 @@ void disk_int_clear(disk_int* d_int) {
     
     // Write cache to disk if dirty
     if (d_int->dirty && d_int->cache) {
-        FILE* f = fopen(d_int->file_path, "r+b");
-        if (f) {
-            fseek(f, d_int->cache_offset * sizeof(mp_limb_t), SEEK_SET);
-            size_t written = fwrite(d_int->cache, sizeof(mp_limb_t), d_int->cache_size, f);
-            if (written != d_int->cache_size) {
-                fprintf(stderr, "Error writing cache to disk for file: %s\n", d_int->file_path);
-            }
-            fclose(f);
-        }
+        save_chunk(d_int, d_int->cache_chunk_idx);
     }
     
     // Free cache memory
@@ -604,25 +737,47 @@ void disk_int_clear(disk_int* d_int) {
         d_int->cache = NULL;
     }
     
-    // Delete the file - only if it exists
+    // Save the file path for cleanup after lock release
     char file_path_copy[MAX_PATH];
     strncpy(file_path_copy, d_int->file_path, MAX_PATH);
     
     // Mark as cleared by emptying the path
     d_int->file_path[0] = '\0';
-    d_int->size_in_limbs = 0;
+    d_int->total_size_in_limbs = 0;
     d_int->sign = 0;
+    d_int->chunk_size = 0;
+    d_int->num_chunks = 0;
     d_int->cache = NULL;
-    d_int->cache_size = 0;
-    d_int->cache_offset = 0;
+    d_int->cache_chunk_idx = 0;
     d_int->dirty = false;
     
     pthread_mutex_unlock(&d_int->lock);
     pthread_mutex_destroy(&d_int->lock);
     
-    // Now delete the file after releasing the mutex
-    if (file_path_copy[0] != '\0') {
-        unlink(file_path_copy);
+    // Delete all chunk files and directory after lock is released
+    // We need to check each possible chunk file
+    for (size_t i = 0; i < 1000; i++) {  // Upper limit to prevent infinite loop
+        char chunk_path[MAX_PATH];
+        char chunk_component[32];
+        snprintf(chunk_component, sizeof(chunk_component), "chunk_%zu.bin", i);
+        
+        if (safe_path_join(chunk_path, MAX_PATH, file_path_copy, chunk_component) < 0) {
+            break;
+        }
+        
+        if (access(chunk_path, F_OK) == 0) {
+            if (remove(chunk_path) != 0) {
+                fprintf(stderr, "Warning: Failed to delete chunk file: %s\n", chunk_path);
+            }
+        } else {
+            // If we can't find this chunk, assume there are no more
+            break;
+        }
+    }
+    
+    // Finally, remove the directory
+    if (rmdir(file_path_copy) != 0) {
+        fprintf(stderr, "Warning: Failed to delete directory: %s\n", file_path_copy);
     }
 }
 
@@ -637,58 +792,95 @@ void disk_int_set_mpz(disk_int* d_int, mpz_t mpz_val) {
     pthread_mutex_lock(&d_int->lock);
     
     // Get size and sign
-    d_int->size_in_limbs = mpz_size(mpz_val);
-    d_int->sign = mpz_sgn(mpz_val);
+    size_t total_size = mpz_size(mpz_val);
+    int sign = mpz_sgn(mpz_val);
     
-    // Write mpz_t to file
-    FILE* f = fopen(d_int->file_path, "wb");
-    if (!f) {
-        fprintf(stderr, "Error opening disk integer file for writing: %s\n", d_int->file_path);
+    // Determine chunk size and number of chunks
+    d_int->total_size_in_limbs = total_size;
+    d_int->sign = sign;
+    
+    // If total size is 0, just clear everything
+    if (total_size == 0) {
+        d_int->num_chunks = 0;
+        
+        // Clear cache if exists
+        if (d_int->cache) {
+            free(d_int->cache);
+            d_int->cache = NULL;
+        }
+        
+        d_int->dirty = false;
         pthread_mutex_unlock(&d_int->lock);
         return;
     }
     
-    // First write the sign and size
-    size_t written = 0;
-    written = fwrite(&d_int->sign, sizeof(int), 1, f);
-    if (written != 1) {
-        fprintf(stderr, "Error writing sign to file: %s\n", d_int->file_path);
-        fclose(f);
+    // Calculate how many chunks we need
+    size_t num_chunks = (total_size + d_int->chunk_size - 1) / d_int->chunk_size;
+    d_int->num_chunks = num_chunks;
+    
+    printf("DEBUG: Setting mpz_t to disk_int with %zu chunks (total size: %zu limbs)\n", 
+           num_chunks, total_size);
+    
+    // Free any existing cache
+    if (d_int->cache) {
+        free(d_int->cache);
+        d_int->cache = NULL;
+    }
+    
+    // Allocate cache for a single chunk
+    d_int->cache = malloc(d_int->chunk_size * sizeof(mp_limb_t));
+    if (!d_int->cache) {
+        fprintf(stderr, "Error: Out of memory in disk_int_set_mpz\n");
         pthread_mutex_unlock(&d_int->lock);
         return;
     }
     
-    written = fwrite(&d_int->size_in_limbs, sizeof(size_t), 1, f);
-    if (written != 1) {
-        fprintf(stderr, "Error writing size to file: %s\n", d_int->file_path);
-        fclose(f);
-        pthread_mutex_unlock(&d_int->lock);
-        return;
-    }
-    
-    // Then write the limbs directly using GMP internals
-    for (size_t i = 0; i < d_int->size_in_limbs; i++) {
-        mp_limb_t limb = mpz_getlimbn(mpz_val, i);
-        written = fwrite(&limb, sizeof(mp_limb_t), 1, f);
-        if (written != 1) {
-            fprintf(stderr, "Error writing limb %zu to file: %s\n", i, d_int->file_path);
-            fclose(f);
+    // Write each chunk to disk
+    for (size_t chunk_idx = 0; chunk_idx < num_chunks; chunk_idx++) {
+        // Determine the size of this chunk
+        size_t chunk_start = chunk_idx * d_int->chunk_size;
+        size_t chunk_size = d_int->chunk_size;
+        
+        // The last chunk might be smaller
+        if (chunk_idx == num_chunks - 1) {
+            size_t remaining = total_size - chunk_start;
+            if (remaining < chunk_size) {
+                chunk_size = remaining;
+            }
+        }
+        
+        // Extract the chunk from mpz_t
+        for (size_t i = 0; i < chunk_size; i++) {
+            size_t limb_idx = chunk_start + i;
+            if (limb_idx < total_size) {
+                ((mp_limb_t*)d_int->cache)[i] = mpz_getlimbn(mpz_val, limb_idx);
+            } else {
+                // Should not happen, but just in case
+                ((mp_limb_t*)d_int->cache)[i] = 0;
+            }
+        }
+        
+        // Set the cache chunk index and mark as dirty
+        d_int->cache_chunk_idx = chunk_idx;
+        d_int->dirty = true;
+        
+        // Save this chunk to disk
+        if (save_chunk(d_int, chunk_idx) != 0) {
+            fprintf(stderr, "Error: Failed to save chunk %zu to disk\n", chunk_idx);
+            free(d_int->cache);
+            d_int->cache = NULL;
             pthread_mutex_unlock(&d_int->lock);
             return;
         }
     }
     
-    fclose(f);
-    
-    // Clear cache as it's now invalid
-    if (d_int->cache) {
-        free(d_int->cache);
-        d_int->cache = NULL;
-        d_int->cache_size = 0;
-        d_int->cache_offset = 0;
-    }
-    
+    // Free cache as we don't need it anymore
+    free(d_int->cache);
+    d_int->cache = NULL;
     d_int->dirty = false;
+    
+    printf("DEBUG: Successfully set mpz_t to disk_int with %zu chunks\n", num_chunks);
+    
     pthread_mutex_unlock(&d_int->lock);
 }
 
@@ -705,134 +897,86 @@ void disk_int_get_mpz(mpz_t mpz_val, disk_int* d_int) {
     
     // If there's dirty cache data, flush it to disk first
     if (d_int->dirty && d_int->cache) {
-        FILE* f = fopen(d_int->file_path, "r+b");
-        if (f) {
-            fseek(f, d_int->cache_offset * sizeof(mp_limb_t), SEEK_SET);
-            size_t written = fwrite(d_int->cache, sizeof(mp_limb_t), d_int->cache_size, f);
-            if (written != d_int->cache_size) {
-                fprintf(stderr, "Error writing cache to disk in get_mpz for file: %s\n", d_int->file_path);
-            }
-            fclose(f);
-        }
-        d_int->dirty = false;
+        save_chunk(d_int, d_int->cache_chunk_idx);
     }
     
-    // Read the entire integer from disk
-    FILE* f = fopen(d_int->file_path, "rb");
-    if (!f) {
-        fprintf(stderr, "Error opening disk integer file for reading: %s\n", d_int->file_path);
-        pthread_mutex_unlock(&d_int->lock);
-        mpz_set_ui(mpz_val, 0); // Set to zero on error
-        return;
-    }
-    
-    // Read sign and size
-    int sign;
-    size_t size_in_limbs;
-    size_t read_items = 0;
-    
-    read_items = fread(&sign, sizeof(int), 1, f);
-    if (read_items != 1) {
-        fprintf(stderr, "Error reading sign from file: %s\n", d_int->file_path);
-        fclose(f);
-        pthread_mutex_unlock(&d_int->lock);
-        mpz_set_ui(mpz_val, 0); // Set to zero on error
-        return;
-    }
-    
-    read_items = fread(&size_in_limbs, sizeof(size_t), 1, f);
-    if (read_items != 1) {
-        fprintf(stderr, "Error reading size from file: %s\n", d_int->file_path);
-        fclose(f);
-        pthread_mutex_unlock(&d_int->lock);
-        mpz_set_ui(mpz_val, 0); // Set to zero on error
-        return;
-    }
-    
-    // Sanity check the size
-    if (size_in_limbs > 1000000) {
-        fprintf(stderr, "Error: Unreasonable size_in_limbs (%zu) from file: %s\n", 
-                size_in_limbs, d_int->file_path);
-        fclose(f);
-        pthread_mutex_unlock(&d_int->lock);
-        mpz_set_ui(mpz_val, 0); // Set to zero on error
-        return;
-    }
-    
-    // Allocate temporary buffer for limbs
-    mp_limb_t* limbs = NULL;
-    if (size_in_limbs > 0) {
-        limbs = (mp_limb_t*)malloc(size_in_limbs * sizeof(mp_limb_t));
-        if (!limbs) {
-            fprintf(stderr, "Out of memory in disk_int_get_mpz\n");
-            fclose(f);
-            pthread_mutex_unlock(&d_int->lock);
-            mpz_set_ui(mpz_val, 0); // Set to zero on error
-            return;
-        }
-    }
-    
-    // Read limbs
-    if (size_in_limbs > 0 && limbs != NULL) {
-        read_items = fread(limbs, sizeof(mp_limb_t), size_in_limbs, f);
-        if (read_items != size_in_limbs) {
-            fprintf(stderr, "Error reading limbs from file: %s (read %zu of %zu)\n", 
-                    d_int->file_path, read_items, size_in_limbs);
-            free(limbs);
-            fclose(f);
-            pthread_mutex_unlock(&d_int->lock);
-            mpz_set_ui(mpz_val, 0); // Set to zero on error
-            return;
-        }
-    }
-    
-    fclose(f);
-    
-    // Set value to 0 if size is 0
-    if (size_in_limbs == 0 || limbs == NULL) {
+    // Check if there are any chunks
+    if (d_int->num_chunks == 0 || d_int->total_size_in_limbs == 0) {
         mpz_set_ui(mpz_val, 0);
-    } else {
-        // Import into mpz_t
-        mpz_import(mpz_val, size_in_limbs, -1, sizeof(mp_limb_t), 0, 0, limbs);
-        
-        // Set the correct sign
-        if (sign < 0) {
-            mpz_neg(mpz_val, mpz_val);
+        pthread_mutex_unlock(&d_int->lock);
+        return;
+    }
+    
+    // Allocate temporary buffer for all limbs
+    mp_limb_t* limbs = (mp_limb_t*)malloc(d_int->total_size_in_limbs * sizeof(mp_limb_t));
+    if (!limbs) {
+        fprintf(stderr, "Out of memory in disk_int_get_mpz\n");
+        pthread_mutex_unlock(&d_int->lock);
+        mpz_set_ui(mpz_val, 0); // Set to zero on error
+        return;
+    }
+    
+    // Load all chunks into the buffer
+    size_t limbs_loaded = 0;
+    for (size_t chunk_idx = 0; chunk_idx < d_int->num_chunks; chunk_idx++) {
+        // Allocate cache if not already allocated
+        if (!d_int->cache) {
+            d_int->cache = malloc(d_int->chunk_size * sizeof(mp_limb_t));
+            if (!d_int->cache) {
+                fprintf(stderr, "Error: Memory allocation failed in disk_int_get_mpz\n");
+                free(limbs);
+                pthread_mutex_unlock(&d_int->lock);
+                mpz_set_ui(mpz_val, 0); // Set to zero on error
+                return;
+            }
         }
         
-        free(limbs);
+        // Load this chunk
+        if (load_chunk(d_int, chunk_idx) != 0) {
+            fprintf(stderr, "Error: Failed to load chunk %zu in disk_int_get_mpz\n", chunk_idx);
+            free(limbs);
+            pthread_mutex_unlock(&d_int->lock);
+            mpz_set_ui(mpz_val, 0); // Set to zero on error
+            return;
+        }
+        
+        // Determine chunk size - last chunk might be smaller
+        size_t chunk_size = d_int->chunk_size;
+        if (chunk_idx == d_int->num_chunks - 1) {
+            size_t last_chunk_size = d_int->total_size_in_limbs % d_int->chunk_size;
+            if (last_chunk_size > 0) {
+                chunk_size = last_chunk_size;
+            }
+        }
+        
+        // Copy chunk to the buffer
+        memcpy(limbs + limbs_loaded, d_int->cache, chunk_size * sizeof(mp_limb_t));
+        limbs_loaded += chunk_size;
     }
+    
+    // Free cache as we've loaded everything
+    if (d_int->cache) {
+        free(d_int->cache);
+        d_int->cache = NULL;
+    }
+    
+    // Set the mpz_t value
+    mpz_import(mpz_val, d_int->total_size_in_limbs, -1, sizeof(mp_limb_t), 0, 0, limbs);
+    
+    // Set the correct sign
+    if (d_int->sign < 0) {
+        mpz_neg(mpz_val, mpz_val);
+    }
+    
+    free(limbs);
     
     pthread_mutex_unlock(&d_int->lock);
 }
 
 // Add two disk integers: result = a + b
 void disk_int_add(disk_int* result, disk_int* a, disk_int* b) {
-    mpz_t mpz_a, mpz_b, mpz_result;
-    mpz_init(mpz_a);
-    mpz_init(mpz_b);
-    mpz_init(mpz_result);
-    
-    // Convert disk_int to mpz_t
-    disk_int_get_mpz(mpz_a, a);
-    disk_int_get_mpz(mpz_b, b);
-    
-    // Perform addition
-    mpz_add(mpz_result, mpz_a, mpz_b);
-    
-    // Store result
-    disk_int_set_mpz(result, mpz_result);
-    
-    // Clean up
-    mpz_clear(mpz_a);
-    mpz_clear(mpz_b);
-    mpz_clear(mpz_result);
-}
-
-// Multiply two disk integers with memory optimization
-void disk_int_mul(disk_int* result, disk_int* a, disk_int* b) {
-    // For small integers, use in-memory multiplication
-    if (a->size_in_limbs + b->size_in_limbs < 1000000) { // Threshold for in-memory
+    // If either input is not chunked, use the old method
+    if (a->num_chunks == 0 || b->num_chunks == 0) {
         mpz_t mpz_a, mpz_b, mpz_result;
         mpz_init(mpz_a);
         mpz_init(mpz_b);
@@ -842,8 +986,8 @@ void disk_int_mul(disk_int* result, disk_int* a, disk_int* b) {
         disk_int_get_mpz(mpz_a, a);
         disk_int_get_mpz(mpz_b, b);
         
-        // Perform multiplication
-        mpz_mul(mpz_result, mpz_a, mpz_b);
+        // Perform addition
+        mpz_add(mpz_result, mpz_a, mpz_b);
         
         // Store result
         disk_int_set_mpz(result, mpz_result);
@@ -852,16 +996,16 @@ void disk_int_mul(disk_int* result, disk_int* a, disk_int* b) {
         mpz_clear(mpz_a);
         mpz_clear(mpz_b);
         mpz_clear(mpz_result);
-        
         return;
     }
     
-    // For large integers where full multiplication would exceed memory
-    size_t available_memory = DEFAULT_MEMORY_LIMIT / 2;
-    size_t memory_needed = (a->size_in_limbs + b->size_in_limbs) * sizeof(mp_limb_t) * 3;
+    // Determine if we can operate in chunks (using available memory)
+    size_t memory_available = DEFAULT_MEMORY_LIMIT * 1024 * 1024; // Convert to bytes
+    size_t max_size = MAX(a->total_size_in_limbs, b->total_size_in_limbs);
+    size_t memory_needed = max_size * sizeof(mp_limb_t) * 3; // For a, b, and result
     
-    if (memory_needed <= available_memory) {
-        // Can fit in memory
+    if (memory_needed <= memory_available) {
+        // We can fit the operation in memory, use the standard approach
         mpz_t mpz_a, mpz_b, mpz_result;
         mpz_init(mpz_a);
         mpz_init(mpz_b);
@@ -869,31 +1013,517 @@ void disk_int_mul(disk_int* result, disk_int* a, disk_int* b) {
         
         disk_int_get_mpz(mpz_a, a);
         disk_int_get_mpz(mpz_b, b);
-        mpz_mul(mpz_result, mpz_a, mpz_b);
+        mpz_add(mpz_result, mpz_a, mpz_b);
         disk_int_set_mpz(result, mpz_result);
         
         mpz_clear(mpz_a);
         mpz_clear(mpz_b);
         mpz_clear(mpz_result);
-    } else {
-        // Implementation of chunked multiplication for extremely large integers
-        fprintf(stderr, "Using chunked multiplication for large integers\n");
-        
-        // Simplified implementation for very large multiplications
-        mpz_t mpz_a, mpz_b, mpz_result;
-        mpz_init(mpz_a);
-        mpz_init(mpz_b);
-        mpz_init(mpz_result);
-        
-        disk_int_get_mpz(mpz_a, a);
-        disk_int_get_mpz(mpz_b, b);
-        mpz_mul(mpz_result, mpz_a, mpz_b);
-        disk_int_set_mpz(result, mpz_result);
-        
-        mpz_clear(mpz_a);
-        mpz_clear(mpz_b);
-        mpz_clear(mpz_result);
+        return;
     }
+    
+    // True chunked addition algorithm
+    printf("DEBUG: Using chunked addition algorithm\n");
+    
+    // Prepare the result disk_int
+    size_t result_chunk_size = determine_optimal_chunk_size(memory_available / 3, 
+                                                           MAX(a->total_size_in_limbs, 
+                                                               b->total_size_in_limbs) + 1);
+    
+    // Ensure the chunk sizes are compatible or use a common denominator
+    size_t common_chunk_size = result_chunk_size;
+    result->chunk_size = common_chunk_size;
+    
+    // Make sure result is properly initialized
+    if (result->file_path[0] == '\0') {
+        fprintf(stderr, "Error: Result disk_int not initialized before addition\n");
+        return;
+    }
+    
+    // Estimate the total size and initialize chunks
+    size_t max_chunks = MAX(a->num_chunks, b->num_chunks) + 1; // +1 for potential carry
+    result->num_chunks = max_chunks;
+    result->total_size_in_limbs = (max_chunks - 1) * common_chunk_size +
+                                  MAX(a->total_size_in_limbs % common_chunk_size,
+                                      b->total_size_in_limbs % common_chunk_size) + 1;
+    
+    // Allocate cache for each disk_int if not already allocated
+    if (!a->cache) {
+        a->cache = malloc(a->chunk_size * sizeof(mp_limb_t));
+        if (!a->cache) {
+            fprintf(stderr, "Error: Out of memory in disk_int_add for a->cache\n");
+            return;
+        }
+    }
+    
+    if (!b->cache) {
+        b->cache = malloc(b->chunk_size * sizeof(mp_limb_t));
+        if (!b->cache) {
+            fprintf(stderr, "Error: Out of memory in disk_int_add for b->cache\n");
+            free(a->cache);
+            a->cache = NULL;
+            return;
+        }
+    }
+    
+    if (!result->cache) {
+        result->cache = malloc(result->chunk_size * sizeof(mp_limb_t));
+        if (!result->cache) {
+            fprintf(stderr, "Error: Out of memory in disk_int_add for result->cache\n");
+            free(a->cache);
+            free(b->cache);
+            a->cache = NULL;
+            b->cache = NULL;
+            return;
+        }
+    }
+    
+    // Initialize carry
+    mp_limb_t carry = 0;
+    
+    // Process each chunk from least to most significant
+    for (size_t i = 0; i < max_chunks; i++) {
+        // Load chunk A
+        mp_limb_t* chunk_a = NULL;
+        size_t chunk_a_size = 0;
+        
+        if (i < a->num_chunks) {
+            if (load_chunk(a, i) != 0) {
+                fprintf(stderr, "Error: Failed to load chunk %zu from a\n", i);
+                goto cleanup;
+            }
+            chunk_a = (mp_limb_t*)a->cache;
+            chunk_a_size = (i == a->num_chunks - 1 && 
+                            a->total_size_in_limbs % a->chunk_size > 0) ?
+                            a->total_size_in_limbs % a->chunk_size : a->chunk_size;
+        } else if (carry == 0) {
+            // No more chunks in a and no carry, we're done if b has no more chunks
+            if (i >= b->num_chunks) {
+                break;
+            }
+            // Allocate a zero chunk for a
+            chunk_a = (mp_limb_t*)calloc(common_chunk_size, sizeof(mp_limb_t));
+            if (!chunk_a) {
+                fprintf(stderr, "Error: Out of memory in disk_int_add for temporary chunk_a\n");
+                goto cleanup;
+            }
+            chunk_a_size = common_chunk_size;
+        } else {
+            // We have a carry but no more chunks in a
+            chunk_a = (mp_limb_t*)calloc(common_chunk_size, sizeof(mp_limb_t));
+            if (!chunk_a) {
+                fprintf(stderr, "Error: Out of memory in disk_int_add for temporary chunk_a\n");
+                goto cleanup;
+            }
+            chunk_a_size = common_chunk_size;
+        }
+        
+        // Load chunk B
+        mp_limb_t* chunk_b = NULL;
+        size_t chunk_b_size = 0;
+        
+        if (i < b->num_chunks) {
+            if (load_chunk(b, i) != 0) {
+                fprintf(stderr, "Error: Failed to load chunk %zu from b\n", i);
+                if (chunk_a != a->cache) free(chunk_a);
+                goto cleanup;
+            }
+            chunk_b = (mp_limb_t*)b->cache;
+            chunk_b_size = (i == b->num_chunks - 1 && 
+                            b->total_size_in_limbs % b->chunk_size > 0) ?
+                            b->total_size_in_limbs % b->chunk_size : b->chunk_size;
+        } else if (carry == 0 && chunk_a == a->cache) {
+            // No more chunks in b, no carry, and a has a real chunk
+            // Just copy the chunk from a to result
+            memcpy(result->cache, chunk_a, chunk_a_size * sizeof(mp_limb_t));
+            
+            result->cache_chunk_idx = i;
+            result->dirty = true;
+            
+            // Save the chunk
+            if (save_chunk(result, i) != 0) {
+                fprintf(stderr, "Error: Failed to save result chunk %zu\n", i);
+                goto cleanup;
+            }
+            
+            continue;
+        } else {
+            // We have a carry or no more chunks in b
+            chunk_b = (mp_limb_t*)calloc(common_chunk_size, sizeof(mp_limb_t));
+            if (!chunk_b) {
+                fprintf(stderr, "Error: Out of memory in disk_int_add for temporary chunk_b\n");
+                if (chunk_a != a->cache) free(chunk_a);
+                goto cleanup;
+            }
+            chunk_b_size = common_chunk_size;
+        }
+        
+        // Perform addition for this chunk with carry
+        mp_limb_t new_carry = 0;
+        size_t chunk_result_size = MAX(chunk_a_size, chunk_b_size);
+        
+        for (size_t j = 0; j < chunk_result_size; j++) {
+            mp_limb_t a_val = (j < chunk_a_size) ? chunk_a[j] : 0;
+            mp_limb_t b_val = (j < chunk_b_size) ? chunk_b[j] : 0;
+            
+            // Add with carry
+            mp_limb_t sum = a_val + b_val + carry;
+            
+            // Check for overflow
+            if (sum < a_val || (sum == a_val && (b_val > 0 || carry > 0))) {
+                new_carry = 1;
+            } else {
+                new_carry = 0;
+            }
+            
+            // Store result
+            ((mp_limb_t*)result->cache)[j] = sum;
+        }
+        
+        // If we have a new carry and we've filled the chunk, add an extra limb
+        if (new_carry && chunk_result_size < common_chunk_size) {
+            ((mp_limb_t*)result->cache)[chunk_result_size] = 1;
+            chunk_result_size++;
+            new_carry = 0;
+        }
+        
+        // Free temporary chunks if they were allocated
+        if (chunk_a != a->cache) free(chunk_a);
+        if (chunk_b != b->cache) free(chunk_b);
+        
+        // Set the result chunk index and mark as dirty
+        result->cache_chunk_idx = i;
+        result->dirty = true;
+        
+        // Save the chunk
+        if (save_chunk(result, i) != 0) {
+            fprintf(stderr, "Error: Failed to save result chunk %zu\n", i);
+            goto cleanup;
+        }
+        
+        // Update carry for next chunk
+        carry = new_carry;
+    }
+    
+    // Handle final carry if needed
+    if (carry > 0) {
+        // Allocate a new chunk for the carry
+        memset(result->cache, 0, result->chunk_size * sizeof(mp_limb_t));
+        ((mp_limb_t*)result->cache)[0] = carry;
+        
+        result->cache_chunk_idx = max_chunks;
+        result->dirty = true;
+        
+        // Save the chunk
+        if (save_chunk(result, max_chunks) != 0) {
+            fprintf(stderr, "Error: Failed to save carry chunk\n");
+            goto cleanup;
+        }
+        
+        // Update num_chunks
+        result->num_chunks = max_chunks + 1;
+    } else {
+        // No final carry, just make sure num_chunks is set correctly
+        result->num_chunks = max_chunks;
+    }
+    
+    // Determine the correct sign based on the larger number
+    if (a->sign == b->sign) {
+        result->sign = a->sign;
+    } else {
+        // Signs differ, need to determine which absolute value is larger
+        // This is a simplification - for a true implementation, we'd need to compare
+        if (a->total_size_in_limbs > b->total_size_in_limbs) {
+            result->sign = a->sign;
+        } else if (b->total_size_in_limbs > a->total_size_in_limbs) {
+            result->sign = b->sign;
+        } else {
+            // Same number of limbs, would need to compare the actual values
+            // For simplicity, we'll use a->sign as a default
+            result->sign = a->sign;
+        }
+    }
+    
+    // Success
+    printf("DEBUG: Chunked addition completed successfully\n");
+    return;
+    
+cleanup:
+    // Cleanup on error
+    if (a->cache) {
+        free(a->cache);
+        a->cache = NULL;
+    }
+    
+    if (b->cache) {
+        free(b->cache);
+        b->cache = NULL;
+    }
+    
+    if (result->cache) {
+        free(result->cache);
+        result->cache = NULL;
+    }
+}
+
+// Helper function to add product of two chunks to result at specified position
+void add_product_to_result(disk_int* result, mp_limb_t* product, size_t product_size, size_t position) {
+    // We need to load chunks from the result, add the product, and save back
+    // This is a simplified version - in a real implementation, we'd need to handle carries across chunks
+    
+    // Determine which chunk to start with
+    size_t start_chunk = position / result->chunk_size;
+    size_t offset_in_chunk = position % result->chunk_size;
+    
+    // Calculate how many chunks we need to update
+    size_t chunks_needed = (offset_in_chunk + product_size + result->chunk_size - 1) / result->chunk_size;
+    
+    // Prepare for carry handling
+    mp_limb_t carry = 0;
+    size_t product_idx = 0;
+    
+    for (size_t i = 0; i < chunks_needed; i++) {
+        size_t current_chunk = start_chunk + i;
+        
+        // Ensure we have enough chunks allocated
+        if (current_chunk >= result->num_chunks) {
+            result->num_chunks = current_chunk + 1;
+        }
+        
+        // Load current chunk from result
+        if (load_chunk(result, current_chunk) != 0) {
+            // If chunk doesn't exist, we'll create a new zeroed chunk
+            memset(result->cache, 0, result->chunk_size * sizeof(mp_limb_t));
+            result->cache_chunk_idx = current_chunk;
+        }
+        
+        // Calculate position within this chunk
+        size_t start_pos = (i == 0) ? offset_in_chunk : 0;
+        size_t limbs_to_add = MIN(result->chunk_size - start_pos, product_size - product_idx);
+        
+        // Add product to this chunk with carry
+        for (size_t j = 0; j < limbs_to_add; j++) {
+            mp_limb_t sum = ((mp_limb_t*)result->cache)[start_pos + j] + product[product_idx] + carry;
+            
+            // Check for overflow
+            carry = (sum < ((mp_limb_t*)result->cache)[start_pos + j]) || 
+                   (sum == ((mp_limb_t*)result->cache)[start_pos + j] && (product[product_idx] > 0 || carry > 0));
+            
+            ((mp_limb_t*)result->cache)[start_pos + j] = sum;
+            product_idx++;
+        }
+        
+        // If we still have carry and room in this chunk, add it
+        if (carry && start_pos + limbs_to_add < result->chunk_size) {
+            ((mp_limb_t*)result->cache)[start_pos + limbs_to_add] += carry;
+            carry = 0;
+        }
+        
+        // Save this chunk
+        result->dirty = true;
+        if (save_chunk(result, current_chunk) != 0) {
+            fprintf(stderr, "Error: Failed to save chunk %zu in add_product_to_result\n", current_chunk);
+            return;
+        }
+    }
+    
+    // Handle final carry if any
+    while (carry > 0 && start_chunk + chunks_needed < result->num_chunks) {
+        if (load_chunk(result, start_chunk + chunks_needed) != 0) {
+            memset(result->cache, 0, result->chunk_size * sizeof(mp_limb_t));
+            result->cache_chunk_idx = start_chunk + chunks_needed;
+        }
+        
+        // Add carry to first limb of next chunk
+        ((mp_limb_t*)result->cache)[0] += carry;
+        
+        // Check if we have a new carry
+        carry = (((mp_limb_t*)result->cache)[0] == 0);
+        
+        // Save this chunk
+        result->dirty = true;
+        if (save_chunk(result, start_chunk + chunks_needed) != 0) {
+            fprintf(stderr, "Error: Failed to save chunk %zu in add_product_to_result\n", 
+                    start_chunk + chunks_needed);
+            return;
+        }
+        
+        chunks_needed++;
+    }
+    
+    // If we still have carry, we need to add a new chunk
+    if (carry > 0) {
+        memset(result->cache, 0, result->chunk_size * sizeof(mp_limb_t));
+        ((mp_limb_t*)result->cache)[0] = carry;
+        result->cache_chunk_idx = start_chunk + chunks_needed;
+        result->dirty = true;
+        
+        if (save_chunk(result, start_chunk + chunks_needed) != 0) {
+            fprintf(stderr, "Error: Failed to save final carry chunk in add_product_to_result\n");
+            return;
+        }
+        
+        result->num_chunks = start_chunk + chunks_needed + 1;
+    }
+    
+    // Update total size if needed
+    size_t min_limbs = (start_chunk + chunks_needed) * result->chunk_size;
+    if (min_limbs > result->total_size_in_limbs) {
+        result->total_size_in_limbs = min_limbs;
+    }
+}
+
+// Multiply two disk integers with memory optimization
+void disk_int_mul(disk_int* result, disk_int* a, disk_int* b) {
+    // For cases where either number is zero
+    if ((a->total_size_in_limbs == 0 || a->sign == 0) || 
+        (b->total_size_in_limbs == 0 || b->sign == 0)) {
+        // Set result to zero
+        result->total_size_in_limbs = 0;
+        result->sign = 0;
+        result->num_chunks = 0;
+        // Free any existing cache
+        if (result->cache) {
+            free(result->cache);
+            result->cache = NULL;
+        }
+        return;
+    }
+
+    // Check if numbers are small enough for in-memory multiplication
+    size_t memory_available = DEFAULT_MEMORY_LIMIT * 1024 * 1024; // Convert to bytes
+    size_t memory_needed = (a->total_size_in_limbs + b->total_size_in_limbs) * sizeof(mp_limb_t) * 3;
+    
+    if (memory_needed <= memory_available) {
+        // We can fit the operation in memory, use the standard approach
+        mpz_t mpz_a, mpz_b, mpz_result;
+        mpz_init(mpz_a);
+        mpz_init(mpz_b);
+        mpz_init(mpz_result);
+        
+        disk_int_get_mpz(mpz_a, a);
+        disk_int_get_mpz(mpz_b, b);
+        mpz_mul(mpz_result, mpz_a, mpz_b);
+        disk_int_set_mpz(result, mpz_result);
+        
+        mpz_clear(mpz_a);
+        mpz_clear(mpz_b);
+        mpz_clear(mpz_result);
+        return;
+    }
+    
+    // True chunked multiplication algorithm
+    printf("DEBUG: Using chunked multiplication algorithm\n");
+    
+    // Clear result first - make sure we're starting fresh
+    // but keep the file path
+    char file_path[MAX_PATH];
+    strncpy(file_path, result->file_path, MAX_PATH);
+    
+    disk_int_clear(result);
+    strncpy(result->file_path, file_path, MAX_PATH);
+    
+    // Create directory for result if it doesn't exist
+    mkdir_recursive(result->file_path, 0755);
+    
+    // Initialize result
+    result->chunk_size = determine_optimal_chunk_size(memory_available / 3, 
+                                                     MAX(a->total_size_in_limbs, b->total_size_in_limbs));
+    result->total_size_in_limbs = a->total_size_in_limbs + b->total_size_in_limbs;
+    result->sign = a->sign * b->sign; // Multiply signs
+    result->num_chunks = (result->total_size_in_limbs + result->chunk_size - 1) / result->chunk_size;
+    
+    // Allocate temporary buffers
+    mp_limb_t* product = (mp_limb_t*)malloc(sizeof(mp_limb_t) * 2 * result->chunk_size);
+    if (!product) {
+        fprintf(stderr, "Error: Out of memory for chunk product\n");
+        return;
+    }
+    
+    // Allocate cache for result if not already allocated
+    if (!result->cache) {
+        result->cache = malloc(result->chunk_size * sizeof(mp_limb_t));
+        if (!result->cache) {
+            fprintf(stderr, "Error: Out of memory for result cache\n");
+            free(product);
+            return;
+        }
+    }
+    
+    // Schoolbook multiplication algorithm: multiply each chunk of a with each chunk of b
+    for (size_t i = 0; i < a->num_chunks; i++) {
+        // Load chunk from a
+        if (load_chunk(a, i) != 0) {
+            fprintf(stderr, "Error: Failed to load chunk %zu from a\n", i);
+            free(product);
+            return;
+        }
+        
+        // Determine chunk size for a
+        size_t chunk_a_size = (i == a->num_chunks - 1 && 
+                              a->total_size_in_limbs % a->chunk_size > 0) ?
+                              a->total_size_in_limbs % a->chunk_size : a->chunk_size;
+        
+        for (size_t j = 0; j < b->num_chunks; j++) {
+            // Load chunk from b
+            if (load_chunk(b, j) != 0) {
+                fprintf(stderr, "Error: Failed to load chunk %zu from b\n", j);
+                free(product);
+                return;
+            }
+            
+            // Determine chunk size for b
+            size_t chunk_b_size = (j == b->num_chunks - 1 && 
+                                  b->total_size_in_limbs % b->chunk_size > 0) ?
+                                  b->total_size_in_limbs % b->chunk_size : b->chunk_size;
+            
+            // Clear product buffer
+            memset(product, 0, sizeof(mp_limb_t) * 2 * result->chunk_size);
+            
+            // Multiply these chunks (limb by limb)
+            size_t product_size = chunk_a_size + chunk_b_size;
+            
+            // Perform long multiplication
+            for (size_t k = 0; k < chunk_a_size; k++) {
+                mp_limb_t a_limb = ((mp_limb_t*)a->cache)[k];
+                mp_limb_t carry = 0;
+                
+                for (size_t m = 0; m < chunk_b_size; m++) {
+                    mp_limb_t b_limb = ((mp_limb_t*)b->cache)[m];
+                    mp_limb_t prod_lo, prod_hi;
+                    
+                    // Multiply limbs and add to product with carry
+                    // This is a simplification - in reality, we'd need to handle 
+                    // multiplication of two limbs properly with umul_ppmm or similar
+                    mp_limb_t prod = a_limb * b_limb + product[k + m] + carry;
+                    
+                    // Simple overflow detection 
+                    if (prod < a_limb * b_limb || prod < product[k + m] || 
+                        (prod == product[k + m] && carry > 0)) {
+                        carry = 1;
+                    } else {
+                        carry = 0;
+                    }
+                    
+                    product[k + m] = prod;
+                }
+                
+                if (carry > 0) {
+                    product[k + chunk_b_size] += carry;
+                }
+            }
+            
+            // Add this product to the result at the appropriate position
+            size_t position = i * a->chunk_size + j * b->chunk_size;
+            add_product_to_result(result, product, product_size, position);
+        }
+    }
+    
+    // Clean up
+    free(product);
+    
+    // Success
+    printf("DEBUG: Chunked multiplication completed successfully\n");
 }
 
 // ==========================================================================

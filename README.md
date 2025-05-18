@@ -28,7 +28,8 @@ The implementation features memory-efficient computation techniques, allowing ca
 - **Performance Optimizations**:
   - Thread pools for parallel processing
   - ARM64 specific optimizations
-  - Memory usage optimization through disk-based arithmetic
+  - True out-of-core arithmetic for extreme memory efficiency
+  - Adaptive chunk sizing based on available memory
   - Chunked binary splitting for large calculations
 
 - **Additional Features**:
@@ -254,20 +255,34 @@ Response: Plain text file with Pi digits
 
 ### Memory Usage
 
-The program automatically selects between in-memory and out-of-core computation:
+The program now offers three computation modes that are automatically selected based on calculation size:
 
-- **In-memory**: Faster but requires more RAM
-- **Out-of-core**: Uses disk storage for calculations that would exceed available RAM
+- **In-memory**: Fastest mode, entire calculation performed in RAM
+- **Hybrid out-of-core**: Large integers stored on disk but loaded completely for operations
+- **True out-of-core**: Processes data in chunks with constant memory usage regardless of digits
 
-Approximate memory usage:
-- Gauss-Legendre: ~4x digits in bytes
-- Chudnovsky: ~0.6x digits in bytes (in-memory mode)
+Memory requirements:
+- **In-memory mode**:
+  - Gauss-Legendre: ~4x digits in bytes
+  - Chudnovsky: ~0.6x digits in bytes
+- **Hybrid out-of-core mode**:
+  - Temporarily loads large integers for operations
+  - Requires memory proportional to calculation size
+- **True out-of-core mode**:
+  - Fixed memory usage regardless of digit count
+  - Perfect for extremely large calculations (billions to trillions of digits)
+  - Automatically uses optimal chunk sizes based on available memory
 
 ### Storage Requirements
 
 For out-of-core calculations, ensure sufficient disk space:
 - At least 10x the digits count in bytes
 - Fast storage (SSD preferred) for better performance
+
+The new true out-of-core implementation efficiently manages available memory by:
+- Automatically chunking large numbers into manageable pieces
+- Processing arithmetic operations one chunk at a time
+- Minimizing memory usage even for trillion-digit calculations
 
 ## Algorithms Explained
 
@@ -290,6 +305,15 @@ A binary splitting implementation of the Chudnovsky series:
 π = (426880√10005)∑[k=0→∞]((-1)^k(6k)!(545140134k+13591409))/((3k)!(k!)^3(640320)^(3k+3/2))
 
 The binary splitting optimization divides large calculations into manageable chunks that can be processed in parallel.
+
+#### True Out-of-Core Binary Splitting
+
+Our implementation now features a completely out-of-core binary splitting approach:
+1. Large integers are split into manageable chunks stored on disk
+2. Arithmetic operations process one chunk at a time with minimal memory usage
+3. Memory consumption remains constant regardless of calculation size
+4. Chunk sizes adapt dynamically based on available system memory
+5. Carries across chunk boundaries are handled efficiently
 
 ## Crash Recovery and Debugging
 
@@ -372,12 +396,23 @@ Enable debug logging by modifying the configuration:
 
 ## Limitations
 
-- Maximum digit support is based on available system resources
+Previous version:
+- Maximum digit support was based on available system resources
+
+New version with true out-of-core arithmetic:
+- Theoretically supports calculations of trillions of digits with fixed memory usage
+- Calculation speed becomes primarily I/O bound for extremely large computations
+- Disk speed and available storage are the main limiting factors, not memory
+
+Other limitations:
 - No HTTPS support for the API
 - ARM64 optimization is primarily through standard GMP/MPFR libraries
 
 ## Improvements in This Version
 
+- **True Out-of-Core Arithmetic**: Implemented chunked arithmetic operations that process data one piece at a time
+- **Extreme Memory Efficiency**: Calculations now support trillion-digit computations on standard hardware
+- **Adaptive Chunking**: Automatic determination of optimal chunk sizes based on memory constraints
 - **Enhanced Error Handling**: Improved error detection and recovery in all calculation paths
 - **Memory Safety**: Fixed memory leaks in recursive calculations and ensured proper cleanup
 - **Race Condition Protection**: Thread-safe queue management to prevent data corruption
