@@ -3758,10 +3758,47 @@ void calculation_state_init(calculation_state* state, unsigned long digits, algo
         // Create path for Chudnovsky state
         char current_path[MAX_PATH];
         snprintf(current_path, MAX_PATH, "%s/current", work_dir);
-        mkdir_recursive(current_path, 0755);
+        
+        // Delete current directory if it's not a directory (could be a failed symlink)
+        struct stat st;
+        if (lstat(current_path, &st) == 0 && !S_ISDIR(st.st_mode)) {
+            printf("DEBUG: Removing existing current path that is not a directory\n");
+            unlink(current_path);
+        }
+        
+        // Create the directory
+        if (mkdir_recursive(current_path, 0755) != 0) {
+            fprintf(stderr, "Error: Failed to create current directory: %s\n", current_path);
+            return;
+        }
+        
+        // Create subdirectories for P, Q, T
+        char p_dir[MAX_PATH], q_dir[MAX_PATH], t_dir[MAX_PATH];
+        if (safe_path_join(p_dir, MAX_PATH, current_path, "P") < 0 ||
+            safe_path_join(q_dir, MAX_PATH, current_path, "Q") < 0 ||
+            safe_path_join(t_dir, MAX_PATH, current_path, "T") < 0) {
+            fprintf(stderr, "Error: Failed to create P,Q,T paths\n");
+            return;
+        }
+        
+        // Create the directories for P, Q, T
+        if (mkdir_recursive(p_dir, 0755) != 0 ||
+            mkdir_recursive(q_dir, 0755) != 0 ||
+            mkdir_recursive(t_dir, 0755) != 0) {
+            fprintf(stderr, "Error: Failed to create P,Q,T directories\n");
+            return;
+        }
         
         // Initialize Chudnovsky state
         chudnovsky_state_init(&state->data.chudnovsky, current_path);
+        
+        // Verify initialization was successful
+        if (state->data.chudnovsky.P.file_path[0] == '\0' || 
+            state->data.chudnovsky.Q.file_path[0] == '\0' || 
+            state->data.chudnovsky.T.file_path[0] == '\0') {
+            fprintf(stderr, "Error: Failed to properly initialize Chudnovsky state\n");
+            return;
+        }
     } else {
         // Initialize Gauss-Legendre state
         mpfr_prec_t precision = digits * 4 + GL_PRECISION_BITS;
@@ -6369,6 +6406,9 @@ void run_server_mode() {
 
 // Run the CLI mode
 void run_cli_mode(int argc, char** argv) {
+    // Initialize jobs array to ensure it's available for crash handling
+    initialize_jobs();
+    
     // Determine algorithm
     algorithm_t algorithm = config.default_algorithm;
     
