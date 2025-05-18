@@ -1209,7 +1209,8 @@ void calc_task_free(calc_task* t) {
 struct http_thread_pool {
     pthread_t* threads;      // Array of thread handles
     int num_threads;         // Number of threads in the pool
-    sem_t job_semaphore;     // Semaphore for job availability
+    sem_t* job_semaphore;    // Semaphore for job availability (named semaphore for macOS compatibility)
+    char sem_name[32];       // Name of the semaphore
     bool shutdown;           // Shutdown flag
 };
 
@@ -1239,7 +1240,7 @@ void* http_worker_function(void* arg) {
     http_thread_pool* pool = (http_thread_pool*)arg;
     
     while (!pool->shutdown) {
-        sem_wait(&pool->job_semaphore);  // Wait for a job
+        sem_wait(pool->job_semaphore);  // Wait for a job
         
         if (pool->shutdown) {
             break;  // Exit if shutting down
@@ -1280,7 +1281,15 @@ void http_thread_pool_init(http_thread_pool* pool, int num_threads) {
     pool->threads = (pthread_t*)malloc(num_threads * sizeof(pthread_t));
     pool->shutdown = false;
     
-    sem_init(&pool->job_semaphore, 0, 0);
+    // Create a unique semaphore name using process ID and timestamp
+    snprintf(pool->sem_name, sizeof(pool->sem_name), "/pi_http_sem_%d_%ld", getpid(), time(NULL));
+    
+    // Create a named semaphore instead of using sem_init (macOS compatibility)
+    pool->job_semaphore = sem_open(pool->sem_name, O_CREAT | O_EXCL, 0644, 0);
+    if (pool->job_semaphore == SEM_FAILED) {
+        perror("Failed to create semaphore");
+        exit(1);
+    }
     
     for (int i = 0; i < num_threads; i++) {
         pthread_create(&pool->threads[i], NULL, http_worker_function, pool);
@@ -1293,7 +1302,7 @@ void http_thread_pool_shutdown(http_thread_pool* pool) {
     
     // Wake up all worker threads so they can check the shutdown flag
     for (int i = 0; i < pool->num_threads; i++) {
-        sem_post(&pool->job_semaphore);
+        sem_post(pool->job_semaphore);
     }
     
     // Wait for all threads to exit
@@ -1302,7 +1311,8 @@ void http_thread_pool_shutdown(http_thread_pool* pool) {
     }
     
     // Clean up resources
-    sem_destroy(&pool->job_semaphore);
+    sem_close(pool->job_semaphore);
+    sem_unlink(pool->sem_name); // Remove the named semaphore
     free(pool->threads);
 }
 
@@ -3289,7 +3299,7 @@ void run_server_mode() {
             } else {
                 // Queue the job
                 http_enqueue_job(client_sock);
-                sem_post(&http_pool.job_semaphore);
+                sem_post(http_pool.job_semaphore);
             }
             
             pthread_mutex_unlock(&http_queue_lock);
