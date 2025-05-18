@@ -1,141 +1,103 @@
-# Pi Calculator - Hybrid Pi Computation Engine
+# Pi Calculator Server
 
-A high-performance, memory-efficient calculator for computing π (pi) to billions of digits on resource-constrained systems.
+A high-performance Pi digit calculation service with HTTP API and CLI support, optimized for ARM64 architecture.
 
 ## Overview
 
-This project implements a hybrid π calculator that combines multiple algorithms and computational techniques to calculate π to arbitrary precision, even on machines with limited memory. It features both a command-line interface and an HTTP API server, making it flexible for various use cases from local calculations to service-oriented deployments.
+Pi Calculator Server is a hybrid solution for computing Pi digits using mathematically rigorous algorithms. It supports both direct command-line calculation and a RESTful API server mode, making it versatile for various computational needs from personal research to integration with other applications.
+
+The implementation features memory-efficient computation techniques, allowing calculations of millions of digits of Pi even on resource-constrained systems through an innovative out-of-core computation approach.
 
 ## Features
 
 - **Multiple Algorithms**:
-  - Gauss-Legendre (GL) for small to medium calculations (fast for <100,000 digits)
-  - Chudnovsky (CH) for large calculations (highly efficient for millions/billions of digits)
+  - Gauss-Legendre algorithm (faster for smaller calculations)
+  - Chudnovsky algorithm (more efficient for large calculations)
 
-- **Memory Optimization**:
-  - Out-of-core computation for handling calculations larger than available RAM
-  - Disk-based integer implementation for working with extremely large numbers
-  - Automatic mode selection based on calculation size and available memory
+- **Computation Modes**:
+  - In-memory calculation for speed
+  - Out-of-core calculation for handling extremely large digit counts
+  - Automatic mode selection based on calculation size and available resources
 
-- **Parallel Processing**:
-  - Multi-threaded implementation using thread pools
-  - Chunked computation with binary splitting for the Chudnovsky algorithm
+- **Server Capabilities**:
+  - RESTful HTTP API for remote calculation requests
+  - Synchronous or asynchronous calculation options
+  - Job queuing and status tracking
+  - Multi-threaded request handling
 
-- **Dual Interface**:
-  - Command-line mode for direct calculations
-  - HTTP server with a RESTful API for remote access
+- **Performance Optimizations**:
+  - Thread pools for parallel processing
+  - ARM64 specific optimizations
+  - Memory usage optimization through disk-based arithmetic
+  - Chunked binary splitting for large calculations
 
-- **Asynchronous Processing**:
-  - Job management system for long-running calculations
-  - Progress tracking and status reporting
-  - Result persistence and retrieval
+- **Additional Features**:
+  - Checkpointing for long-running calculations
+  - Comprehensive logging
+  - JSON-based configuration
+  - Progress tracking
 
-- **Cross-Platform Compatibility**:
-  - Optimized for ARM64 architecture
-  - Compatible with x86_64 systems
-  - Tested on Ubuntu Linux
+## System Requirements
+
+- Linux-based operating system (tested on Ubuntu)
+- GCC compiler with C11 support
+- At least 2GB RAM (more recommended for larger calculations)
+- Sufficient disk space for out-of-core calculations (10x the memory required for calculation)
+- Required libraries:
+  - GMP (GNU Multiple Precision Arithmetic Library)
+  - MPFR (Multiple Precision Floating-Point Reliable Library)
+  - json-c (JSON manipulation library)
+  - POSIX threads
 
 ## Installation
 
 ### Prerequisites
 
-The following libraries are required:
+Install the required libraries:
 
 ```bash
+# For Debian/Ubuntu
+sudo apt-get update
 sudo apt-get install libgmp-dev libmpfr-dev libjson-c-dev
+
+# For macOS (using Homebrew)
+brew install gmp mpfr json-c
 ```
 
 ### Building from Source
 
 ```bash
-git clone https://github.com/yourusername/pi-calculator.git
-cd pi-calculator
-gcc -o pi_hybrid pi_hybrid.c -lgmp -lmpfr -ljson-c -lm -pthread -O3
+# Clone or download the source code
+git clone https://github.com/yourusername/pi-calculator-server.git
+cd pi-calculator-server
+
+# Compile the code
+gcc -o pi_calculator pi_calculator.c -lm -lgmp -lmpfr -ljson-c -lpthread -O3
+
+# Create default working directory
+mkdir -p ./pi_calc
 ```
-
-## Usage
-
-### Command-Line Mode
-
-Calculate π to a specific number of digits:
-
-```bash
-# Calculate 1 million digits using default algorithm
-./pi_hybrid 1000000
-
-# Specify algorithm (GL = Gauss-Legendre, CH = Chudnovsky)
-./pi_hybrid -a CH 1000000
-
-# Specify thread count and memory limit
-./pi_hybrid -t 4 -m 8 1000000
-```
-
-### Server Mode
-
-Start the HTTP server for API access:
-
-```bash
-# Start with default settings (from config.json)
-./pi_hybrid -s
-
-# Specify custom port and IP
-./pi_hybrid -s -p 8080 -i 0.0.0.0
-
-# Use a specific configuration file
-./pi_hybrid -c custom_config.json -s
-```
-
-## HTTP API Endpoints
-
-### Calculate Pi
-
-```
-GET /pi?digits=1000000&algo=CH&mode=async
-```
-
-Parameters:
-- `digits`: Number of digits to calculate (required)
-- `algo`: Algorithm to use - CH (Chudnovsky) or GL (Gauss-Legendre) (optional, default is CH)
-- `mode`: sync or async (optional, default is sync)
-- `out_of_core`: true or false (optional, default is auto)
-- `checkpoint`: true or false (optional, default is true)
-
-For synchronous requests, returns the calculation result directly. For asynchronous requests, returns a job ID.
-
-### Check Job Status
-
-```
-GET /pi/status?id=job_uuid
-```
-
-Returns the current status of an asynchronous calculation job.
-
-### Get Job Result
-
-```
-GET /pi/result?id=job_uuid
-```
-
-Returns the calculated digits of π for a completed job.
 
 ## Configuration
 
-The application can be configured via a JSON file (`config.json` by default):
+### Configuration File
+
+The server can be configured using a JSON configuration file:
 
 ```json
 {
-  "ip_address": "0.0.0.0",
-  "port": 8081,
-  "max_http_threads": 4,
+  "ip_address": "127.0.0.1",
+  "port": 8080,
+  "max_http_threads": 16,
   "max_calc_threads": 4,
-  "max_digits": 5000000000,
+  "max_digits": 1000000,
   "memory_limit": 20,
-  "default_algorithm": "CH",
+  "default_algorithm": "GL",
   "gl_iterations": 10,
   "gl_precision_bits": 128,
   "logging": {
-    "level": "debug",
-    "output": "piserver.log"
+    "level": "info",
+    "output": "console"
   },
   "work_dir": "./pi_calc",
   "checkpointing_enabled": true,
@@ -147,107 +109,98 @@ The application can be configured via a JSON file (`config.json` by default):
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `ip_address` | IP address for HTTP server | "0.0.0.0" |
-| `port` | Port for HTTP server | 8081 |
-| `max_http_threads` | Maximum HTTP worker threads | 4 |
-| `max_calc_threads` | Maximum calculation threads | 4 |
-| `max_digits` | Maximum digits allowed | 5000000000 |
-| `memory_limit` | Memory limit in GB | 20 |
-| `default_algorithm` | Default algorithm (CH or GL) | "CH" |
-| `gl_iterations` | Iterations for Gauss-Legendre | 10 |
-| `gl_precision_bits` | Extra precision bits for GL | 128 |
-| `logging.level` | Logging level (debug, info, error) | "debug" |
-| `logging.output` | Log output (file path or "console") | "piserver.log" |
-| `work_dir` | Working directory for calculations | "./pi_calc" |
-| `checkpointing_enabled` | Enable/disable checkpointing | true |
-| `checkpoint_interval` | Checkpoint interval in seconds | 600 |
+| `ip_address` | IP address to bind the server | `127.0.0.1` |
+| `port` | Port for the HTTP server | `8080` |
+| `max_http_threads` | Maximum HTTP worker threads | `16` |
+| `max_calc_threads` | Maximum calculation threads | `4` |
+| `max_digits` | Maximum allowed digits for calculation | `1000000` |
+| `memory_limit` | Memory limit in GB | `20` |
+| `default_algorithm` | Default algorithm (`GL` or `CH`) | `GL` |
+| `gl_iterations` | Iterations for Gauss-Legendre | `10` |
+| `gl_precision_bits` | Extra precision bits for calculations | `128` |
+| `logging.level` | Logging level (debug, info, error) | `info` |
+| `logging.output` | Log output (console or file path) | `console` |
+| `work_dir` | Working directory for calculations | `./pi_calc` |
+| `checkpointing_enabled` | Enable calculation checkpoints | `true` |
+| `checkpoint_interval` | Seconds between checkpoints | `600` |
 
-## Algorithm Details
+## Usage
 
-### Gauss-Legendre
+### Command Line Mode
 
-The Gauss-Legendre algorithm is based on the arithmetic-geometric mean and converges quadratically, making it very efficient for small to medium calculations. It's implemented in-memory using the MPFR library.
-
-Formula:
-```
-a₀ = 1
-b₀ = 1/√2
-t₀ = 1/4
-p₀ = 1
-
-For each iteration:
-  aₙ₊₁ = (aₙ + bₙ)/2
-  bₙ₊₁ = √(aₙ * bₙ)
-  tₙ₊₁ = tₙ - pₙ(aₙ - aₙ₊₁)²
-  pₙ₊₁ = 2pₙ
-
-Final π approximation: π ≈ (aₙ + bₙ)²/(4tₙ)
-```
-
-### Chudnovsky
-
-The Chudnovsky algorithm is one of the most efficient algorithms for calculating π to extreme precision. It uses a rapidly converging series based on a Ramanujan-type formula. The implementation uses binary splitting with out-of-core computation for memory efficiency.
-
-Formula:
-```
-π = (Q * (C/24)^(3/2)) / (T * 12)
-
-Where Q, T are computed using binary splitting on the series:
-∑ ((-1)^k * (6k)! * (A + Bk)) / ((3k)! * (k!)^3 * C^(3k))
-
-With constants:
-A = 13591409
-B = 545140134
-C = 640320
-```
-
-## Performance Considerations
-
-### Memory Usage
-
-- **Gauss-Legendre**: Memory usage is approximately 4 * digits bytes
-- **Chudnovsky**: Memory usage depends on implementation mode:
-  - In-memory: Approximately 8 * digits bytes
-  - Out-of-core: Can run with limited RAM (controlled by `memory_limit`)
-
-### Disk Space
-
-For large calculations using out-of-core mode:
-- Working files: ~30-50 times the final result size
-- Final result: ~1.05 bytes per digit
-
-### Calculation Speed
-
-Performance scales approximately with:
-- Chudnovsky: O(n * log(n)^3)
-- Gauss-Legendre: O(n * log(n)^2)
-
-Where n is the number of digits.
-
-## Code Structure
-
-The project is organized into several logical components:
-
-- **Disk-based Integer Implementation**: Custom implementation for handling arbitrary-precision integers using disk storage
-- **Algorithm Implementations**: Separate implementations for Gauss-Legendre and Chudnovsky algorithms
-- **Thread Pools**: For both HTTP request handling and calculation tasks
-- **Job Management**: Asynchronous job tracking and status reporting
-- **HTTP Server**: RESTful API for remote access
-- **Configuration**: JSON-based configuration with command-line overrides
-- **Logging**: Configurable logging system
-
-## Examples
-
-### Calculating 1 Million Digits via CLI
+Calculate Pi digits directly from the command line:
 
 ```bash
-./pi_hybrid -a CH -t 8 1000000
+# Calculate 1000 digits of Pi using default algorithm
+./pi_calculator 1000
+
+# Calculate 10000 digits using Chudnovsky algorithm
+./pi_calculator -a CH 10000
+
+# Use 8 calculation threads with 30GB memory limit
+./pi_calculator -t 8 -m 30 50000
+
+# Specify working directory
+./pi_calculator -w /tmp/pi_work 1000
 ```
 
-### Calculating 1 Billion Digits via API
+### Server Mode
+
+Run as an HTTP server:
 
 ```bash
-curl "http://localhost:8081/pi?digits=1000000000&algo=CH&mode=async"
+# Start server with default settings
+./pi_calculator -s
+
+# Start server on specific IP and port
+./pi_calculator -s -i 0.0.0.0 -p 9000
+
+# Start server with configuration file
+./pi_calculator -s -c config.json
+```
+
+### Command Line Options
+
+| Option | Description |
+|--------|-------------|
+| `-a <algo>` | Algorithm (GL: Gauss-Legendre, CH: Chudnovsky) |
+| `-d <digits>` | Number of digits to calculate |
+| `-t <threads>` | Number of calculation threads |
+| `-m <memory>` | Memory limit in GB |
+| `-w <dir>` | Working directory |
+| `-p <port>` | Server port |
+| `-i <ip>` | Server IP address |
+| `-c <file>` | Configuration file |
+| `-s` | Run in server mode |
+
+## API Documentation
+
+The HTTP API provides endpoints for Pi calculation and job management.
+
+### Calculate Pi (Synchronous)
+
+```
+GE
+- `mode`: Calculation mode (sync or async)
+
+Response:
+```json
+{
+  "algorithm": "GL",
+  "digits": 1000,
+  "out_of_core": false,
+  "time_taken": 153.42,
+  "timestamp": "2023-04-01T12:34:56Z",
+  "file_path": "results/pi_1000.txt",
+  "status": "success",
+  "message": "Calculation completed"
+}
+```
+
+### Calculate Pi (Asynchronous)
+
+```
+GET /pi?algo=CH&digits=10000&mode=async
 ```
 
 Response:
@@ -257,14 +210,14 @@ Response:
   "message": "Calculation queued",
   "job_id": "550e8400-e29b-41d4-a716-446655440000",
   "algorithm": "CH",
-  "digits": 1000000000
+  "digits": 10000
 }
 ```
 
-### Checking Job Status
+### Check Job Status
 
-```bash
-curl "http://localhost:8081/pi/status?id=550e8400-e29b-41d4-a716-446655440000"
+```
+GET /pi/status?id=550e8400-e29b-41d4-a716-446655440000
 ```
 
 Response:
@@ -273,28 +226,116 @@ Response:
   "job_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "running",
   "algorithm": "CH",
-  "digits": 1000000000,
-  "progress": 0.45,
-  "creation_time": 1684251478,
-  "start_time": 1684251480
+  "digits": 10000,
+  "progress": 0.75,
+  "creation_time": 1680358496,
+  "start_time": 1680358497
 }
 ```
 
-## License
+Possible status values: `queued`, `running`, `completed`, `failed`, `canceled`
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+### Get Calculation Result
 
-## Acknowledgments
+```
+GET /pi/result?id=550e8400-e29b-41d4-a716-446655440000
+```
 
-- The implementation is based on well-known algorithms by Gauss-Legendre and the Chudnovsky brothers
-- Makes use of the GMP and MPFR libraries for arbitrary-precision arithmetic
-- Inspired by other π calculators including y-cruncher
+Response: Plain text file with Pi digits
 
-## Contributing
+## Performance Considerations
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+### Algorithm Selection
 
-## Disclaimer
+- **Gauss-Legendre (GL)**: Efficient for calculations up to ~100,000 digits
+- **Chudnovsky (CH)**: More efficient for larger calculations
 
-For very large calculations (billions of digits), this software requires significant computational resources and time. Be prepared for long run times and ensure your system has adequate cooling for extended high CPU utilization.
+### Memory Usage
 
+The program automatically selects between in-memory and out-of-core computation:
+
+- **In-memory**: Faster but requires more RAM
+- **Out-of-core**: Uses disk storage for calculations that would exceed available RAM
+
+Approximate memory usage:
+- Gauss-Legendre: ~4x digits in bytes
+- Chudnovsky: ~0.6x digits in bytes (in-memory mode)
+
+### Storage Requirements
+
+For out-of-core calculations, ensure sufficient disk space:
+- At least 10x the digits count in bytes
+- Fast storage (SSD preferred) for better performance
+
+## Algorithms Explained
+
+### Gauss-Legendre Algorithm
+
+An iterative algorithm based on arithmetic-geometric mean:
+
+1. Initialize: a₀ = 1, b₀ = 1/√2, t₀ = 1/4, p₀ = 1
+2. For each iteration:
+   - aₙ₊₁ = (aₙ + bₙ)/2
+   - bₙ₊₁ = √(aₙ·bₙ)
+   - tₙ₊₁ = tₙ - pₙ(aₙ - aₙ₊₁)²
+   - pₙ₊₁ = 2·pₙ
+3. Calculate Pi: π ≈ (aₙ + bₙ)²/(4·tₙ)
+
+### Chudnovsky Algorithm
+
+A binary splitting implementation of the Chudnovsky series:
+
+π = (426880√10005)∑[k=0→∞]((-1)^k(6k)!(545140134k+13591409))/((3k)!(k!)^3(640320)^(3k+3/2))
+
+The binary splitting optimization divides large calculations into manageable chunks that can be processed in parallel.
+
+## Troubleshooting
+
+### Common Issues
+
+1. **"Failed to create socket" error**
+   - Another process may be using the specified port
+   - Try changing the port using the `-p` option
+
+2. **Out of memory errors**
+   - Reduce the number of digits
+   - Increase the memory limit with `-m` option
+   - Ensure out-of-core mode is enabled for large calculations
+
+3. **Slow calculation performance**
+   - Increase calculation threads with `-t` option
+   - Use Chudnovsky algorithm for large calculations
+   - Use SSD storage for out-of-core calculations
+   - Check for other CPU-intensive processes
+
+### Debug Logging
+
+Enable debug logging by modifying the configuration:
+
+```json
+"logging": {
+  "level": "debug",
+  "output": "pi_calculator.log"
+}
+```
+
+## Limitations
+
+- Maximum digit support is based on available system resources
+- No HTTPS support for the API
+- Limited error recovery for interrupted calculations
+- Temporary files may not be cleaned up if the process is killed
+- ARM64 optimization is primarily through standard GMP/MPFR libraries
+
+## License and Attribution
+
+This software implements:
+- Gauss-Legendre algorithm by Carl Friedrich Gauss and Adrien-Marie Legendre
+- Chudnovsky algorithm by David and Gregory Chudnovsky
+
+The implementation uses:
+- GMP for arbitrary precision arithmetic
+- MPFR for floating-point calculations
+- json-c for JSON parsing
+
+---
