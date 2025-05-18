@@ -4462,37 +4462,39 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     // C = 640320
     mpfr_set_ui(mpfr_C, C, MPFR_RNDN);
     
-    // C^3/24
-    mpfr_pow_ui(mpfr_C3_24, mpfr_C, 3, MPFR_RNDN);
-    mpfr_div_ui(mpfr_C3_24, mpfr_C3_24, 24, MPFR_RNDN);
-    
-    // Calculate Q + A*P
-    mpz_mul_ui(mpz_sum, mpz_P, A);
-    mpz_add(mpz_sum, mpz_sum, mpz_Q);
-    
     // Convert P to mpfr
-    mpfr_set_z(mpfr_pi, mpz_P, MPFR_RNDN);
+    mpfr_set_z(mpfr_P_val, mpz_P, MPFR_RNDN);
     
-    // pi = (C^3/24) * P
-    mpfr_mul(mpfr_pi, mpfr_pi, mpfr_C3_24, MPFR_RNDN);
-    
-    // Check if sum is zero to prevent division by zero
-    if (mpz_sgn(mpz_sum) == 0) {
-        fprintf(stderr, "Error: Q + A*P is zero, cannot divide\n");
-        mpz_set_ui(mpz_sum, 1); // Prevent division by zero
+    // Convert T to mpfr, ensure T is not zero
+    mpfr_set_z(mpfr_T_val, mpz_T, MPFR_RNDN);
+    if (mpfr_sgn(mpfr_T_val) == 0) {
+        fprintf(stderr, "Error: Final T value for Pi calculation is zero. Cannot divide.\n");
+        // Prevent division by zero by setting T_val to 1
+        mpfr_set_ui(mpfr_T_val, 1, MPFR_RNDN);
     }
     
-    // Convert sum to mpfr
-    mpfr_set_z(mpfr_temp, mpz_sum, MPFR_RNDN);
+    // Calculate sqrt(C)
+    mpfr_sqrt(mpfr_sqrt_C, mpfr_C, MPFR_RNDN);
     
-    // pi = pi / (Q + A*P)
+    // Set constant 12
+    mpfr_set_ui(mpfr_const_12, 12, MPFR_RNDN);
+    
+    // Numerator: P * C * sqrt(C)
+    mpfr_mul(mpfr_pi, mpfr_P_val, mpfr_C, MPFR_RNDN);       // pi = P_val * C
+    mpfr_mul(mpfr_pi, mpfr_pi, mpfr_sqrt_C, MPFR_RNDN);     // pi = P_val * C * sqrt(C)
+    
+    // Denominator: 12 * T
+    mpfr_mul(mpfr_temp, mpfr_T_val, mpfr_const_12, MPFR_RNDN);  // temp = T_val * 12
+    
+    // Double check that denominator is not zero
+    if (mpfr_sgn(mpfr_temp) == 0) {
+        fprintf(stderr, "Error: Denominator (12*T) is zero.\n");
+        // Prevent division by zero
+        mpfr_set_ui(mpfr_temp, 1, MPFR_RNDN);
+    }
+    
+    // Final division: pi = Numerator / Denominator
     mpfr_div(mpfr_pi, mpfr_pi, mpfr_temp, MPFR_RNDN);
-    
-    // temp = sqrt(C)
-    mpfr_sqrt(mpfr_temp, mpfr_C, MPFR_RNDN);
-    
-    // pi = pi * sqrt(C)
-    mpfr_mul(mpfr_pi, mpfr_pi, mpfr_temp, MPFR_RNDN);
     
     // Debug output
     mpfr_printf("Final pi value: %.10Rf\n", mpfr_pi);
@@ -4501,12 +4503,13 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     mpz_clear(mpz_P);
     mpz_clear(mpz_Q);
     mpz_clear(mpz_T);
-    mpz_clear(mpz_sum);
     mpfr_clear(mpfr_pi);
     mpfr_clear(mpfr_C);
     mpfr_clear(mpfr_temp);
-    mpfr_clear(mpfr_temp2);
-    mpfr_clear(mpfr_C3_24);
+    mpfr_clear(mpfr_P_val);
+    mpfr_clear(mpfr_T_val);
+    mpfr_clear(mpfr_sqrt_C);
+    mpfr_clear(mpfr_const_12);
     
     // Write the result to file
     FILE* f = fopen(state->output_file, "w");
