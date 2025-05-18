@@ -426,13 +426,18 @@ Other limitations:
 - **Zero-Value Protection**: Improved handling of zero values in binary splitting algorithm
 - **Job Checkpointing**: Auto-save of job state during crashes and shutdowns
 
-## Latest Fixes (May 2025)
+## Latest Fixes (June 2025)
 
-- **ARM64-Optimized Multiplication**: Implemented specialized ARM64 instructions for multiplying limbs with full precision using native `mul` and `umulh` operations
-- **Double-Width Product Handling**: Correctly handling full-precision (128-bit) products in limb-by-limb multiplication for accurate arbitrary-precision calculations
-- **Enhanced Carry Propagation**: Improved carry handling logic in chunked arithmetic operations with robust propagation across chunk boundaries
-- **Cross-Platform Computation**: Added optimized fallback implementation for non-ARM64 platforms ensuring consistent results across all systems
-- **Precise Size Tracking**: Improved accuracy of result size determination based on most significant non-zero limbs
+- **Complete Sign Handling**: Implemented robust sign handling for all arithmetic operations through new comparison and subtraction functions
+- **Ultra-Efficient Cross-Platform Multiplication**: 
+  - ARM64: Optimized multiplication using native `mul` and `umulh` instructions
+  - x86_64/Other Platforms: Added high-performance `__int128`-based implementation when available
+  - Legacy Systems: Improved manual implementation with comprehensive carry propagation
+- **Enhanced Chunked Arithmetic**: Refined out-of-core operations with precise carry/borrow handling across chunk boundaries
+- **Mathematical Correctness Assurance**: Comprehensive algorithm improvements for subtraction, addition, and multiplication operations
+- **Improved Code Documentation**: Enhanced comments explaining complex arithmetic operations for better maintainability
+- **Dynamic Overflow Protection**: Robust detection and handling of numerical overflows in all arithmetic operations
+- **Optimized Memory Usage**: Fine-tuned chunking strategies for better memory efficiency while maintaining performance
 
 ## License and Attribution
 
