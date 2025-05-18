@@ -474,26 +474,23 @@ struct disk_int {
 
 // Get chunk file path from base path and chunk index
 int get_chunk_path(char *dest, size_t dest_size, const char *base_path, size_t chunk_idx) {
-    // Check if the base_path itself contains a file name pattern (int_X_Y)
-    const char *base_name = strrchr(base_path, '/');
-    if (base_name) {
-        base_name++; // Skip the slash
-    } else {
-        base_name = base_path;
+    // Make sure we have a valid base path
+    if (!base_path || base_path[0] == '\0') {
+        fprintf(stderr, "Error: Invalid base path in get_chunk_path\n");
+        return -1;
     }
     
-    // Determine if we're using the old or new format
-    if (strstr(base_name, "int_") != NULL) {
-        // Using the directory-based format (int_PID_ID)
-        char component[32];
-        snprintf(component, sizeof(component), "%zu.bin", chunk_idx);
-        return safe_path_join(dest, dest_size, base_path, component);
-    } else {
-        // Using the old chunk-based format
-        char component[32];
-        snprintf(component, sizeof(component), "chunk_%zu.bin", chunk_idx);
-        return safe_path_join(dest, dest_size, base_path, component);
-    }
+    // Create a consistent naming scheme for all chunk files
+    char component[32];
+    snprintf(component, sizeof(component), "chunk_%zu.bin", chunk_idx);
+    
+    // Create the parent directory for the chunk if it doesn't exist
+    mkdir_recursive(base_path, 0755);
+    
+    // Combine base path with the chunk file name
+    int result = safe_path_join(dest, dest_size, base_path, component);
+    printf("DEBUG: get_chunk_path('%s', %zu) = '%s'\n", base_path, chunk_idx, dest);
+    return result;
 }
 
 // Determine optimal chunk size based on available memory and total size
@@ -583,8 +580,19 @@ int load_chunk(disk_int* d_int, size_t chunk_idx) {
 
 // Save a specific chunk to disk with improved error handling
 int save_chunk(disk_int* d_int, size_t chunk_idx) {
+    if (!d_int) {
+        fprintf(stderr, "Error: Null d_int in save_chunk\n");
+        return -1;
+    }
+    
+    if (d_int->file_path[0] == '\0') {
+        fprintf(stderr, "Error: Uninitialized disk integer in save_chunk\n");
+        return -1;
+    }
+    
     if (chunk_idx >= d_int->num_chunks) {
-        fprintf(stderr, "Error: Invalid chunk index %zu (max is %zu)\n", chunk_idx, d_int->num_chunks - 1);
+        fprintf(stderr, "Error: Invalid chunk index %zu (max is %zu)\n", 
+                chunk_idx, d_int->num_chunks > 0 ? d_int->num_chunks - 1 : 0);
         return -1; // Invalid chunk index
     }
     
@@ -608,6 +616,9 @@ int save_chunk(disk_int* d_int, size_t chunk_idx) {
             chunk_size = last_chunk_size;
         }
     }
+    
+    printf("DEBUG: save_chunk for disk_int at path: %s, chunk_idx: %zu, chunk_size: %zu\n", 
+           d_int->file_path, chunk_idx, chunk_size);
     
     // Construct chunk file path
     char chunk_path[MAX_PATH];
@@ -795,17 +806,40 @@ void disk_int_init(disk_int* d_int, const char* base_path) {
         return;
     }
     
-    // Create a unique directory name for this disk integer
+    // Create a unique directory name for this disk integer based on PID and timestamp
     static int counter = 0;
-    snprintf(d_int->file_path, MAX_PATH, "%s/int_%d_%lu", 
-             base_path, (int)getpid(), (unsigned long)counter++);
+    static long timestamp = 0;
+    
+    // Initialize timestamp if not done
+    if (timestamp == 0) {
+        timestamp = time(NULL);
+    }
+    
+    // Create a unique path for this disk integer
+    snprintf(d_int->file_path, MAX_PATH, "%s/int_%d_%ld_%d", 
+             base_path, (int)getpid(), timestamp, counter++);
     printf("DEBUG: Generated base path: %s\n", d_int->file_path);
     
-    // Create directory structure first
-    if (mkdir_recursive(d_int->file_path, 0755) != 0) {
-        fprintf(stderr, "Error creating directory structure for: %s\n", d_int->file_path);
-        d_int->file_path[0] = '\0';
-        return;
+    // Check if the base directory exists first
+    struct stat st = {0};
+    if (stat(base_path, &st) == -1) {
+        // Base directory doesn't exist - try to create it
+        if (mkdir_recursive(base_path, 0755) != 0) {
+            fprintf(stderr, "Error: Failed to create base directory: %s (errno: %d - %s)\n", 
+                   base_path, errno, strerror(errno));
+            d_int->file_path[0] = '\0';
+            return;
+        }
+    }
+    
+    // Now create the specific directory for this disk integer
+    if (mkdir(d_int->file_path, 0755) != 0) {
+        if (errno != EEXIST) {  // Only report error if it's not because directory already exists
+            fprintf(stderr, "Error creating directory structure for: %s (errno: %d - %s)\n", 
+                   d_int->file_path, errno, strerror(errno));
+            d_int->file_path[0] = '\0';
+            return;
+        }
     }
     
     // Initialize mutex for thread safety
@@ -2309,10 +2343,16 @@ void chudnovsky_state_init(chudnovsky_state* state, const char* base_path) {
         return;
     }
     
-    // Create the directories
-    if (mkdir_recursive(base_path, 0755) != 0) {
-        fprintf(stderr, "Error: Failed to create base directory for Chudnovsky state: %s\n", base_path);
-        return;
+    // Create the directories with better error reporting
+    printf("DEBUG: Creating directory: %s\n", base_path);
+    struct stat st;
+    if (stat(base_path, &st) != 0) {
+        // Directory doesn't exist, create it
+        if (mkdir_recursive(base_path, 0755) != 0) {
+            fprintf(stderr, "Error: Failed to create base directory for Chudnovsky state: %s (errno: %d - %s)\n", 
+                    base_path, errno, strerror(errno));
+            return;
+        }
     }
     
     char p_path[MAX_PATH], q_path[MAX_PATH], t_path[MAX_PATH];
@@ -3986,10 +4026,20 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     }
     
     printf("DEBUG: Split path is: %s\n", split_path);
+    
+    // Ensure we clean up any existing split directory first
+    // Delete the split directory and recreate it fresh to avoid corrupt state
+    printf("DEBUG: Removing existing split directory to ensure clean state\n");
+    char rm_cmd[MAX_PATH + 20];
+    snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf %s", split_path);
+    system(rm_cmd);
+    
+    // Now create fresh split directory
     if (mkdir_recursive(split_path, 0755) != 0) {
         fprintf(stderr, "Error: Failed to create split directory\n");
         return;  // Return early on error
     }
+    printf("DEBUG: Successfully created clean split directory: %s\n", split_path);
     
     // Determine memory threshold based on available memory
     size_t memory_threshold = 1000;  // Default
