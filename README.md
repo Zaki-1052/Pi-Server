@@ -41,7 +41,7 @@ The implementation features memory-efficient computation techniques, allowing ca
 
 ## System Requirements
 
-- Linux-based operating system (tested on Ubuntu)
+- Linux or macOS operating system (tested on Ubuntu and macOS)
 - GCC compiler with C11 support
 - At least 2GB RAM (more recommended for larger calculations)
 - Sufficient disk space for out-of-core calculations (10x the memory required for calculation)
@@ -291,6 +291,29 @@ A binary splitting implementation of the Chudnovsky series:
 
 The binary splitting optimization divides large calculations into manageable chunks that can be processed in parallel.
 
+## Crash Recovery and Debugging
+
+The application now includes comprehensive crash handling mechanisms:
+
+1. **Automatic crash logs**: Detailed logs are created in the working directory when a crash occurs
+2. **Emergency checkpoints**: In-progress calculations are saved during crashes or shutdowns
+3. **Job state preservation**: Active jobs are marked as failed with descriptive error messages
+4. **Shutdown logs**: Complete logs of active jobs and system state during shutdown
+5. **Memory diagnostics**: Crash logs include memory allocation status when available
+
+To recover from a crash:
+
+```bash
+# Check for crash log files in the working directory
+ls -la pi_calculator_crash_*.log
+
+# Review a specific crash log
+cat pi_calculator_crash_1234567890.log
+
+# Check for emergency checkpoints from interrupted calculations
+ls -la */job_*_crash_checkpoint.json
+```
+
 ## Troubleshooting
 
 ### Common Issues
@@ -311,18 +334,30 @@ The binary splitting optimization divides large calculations into manageable chu
    - Check for other CPU-intensive processes
 
 4. **Calculation timeouts**
-   - Default timeouts are set based on digit count:
-     - 3 minutes for calculations ≤ 10,000 digits
-     - 10 minutes for calculations ≤ 100,000 digits
-     - 1 hour for calculations ≤ 1,000,000 digits
-     - 2 hours for calculations ≤ 100,000,000 digits
-     - 3 hours for calculations ≤ 1,000,000,000 digits
-     - 5 hours for calculations ≤ 5,000,000,000 digits
-     - 6 hours for calculations > 5,000,000,000 digits
+   - Default timeouts are set based on digit count with more granular tiers:
+     - 3 minutes for calculations ≤ 1,000 digits
+     - 5 minutes for calculations ≤ 10,000 digits
+     - 10 minutes for calculations ≤ 50,000 digits
+     - 30 minutes for calculations ≤ 100,000 digits
+     - 1 hour for calculations ≤ 500,000 digits
+     - 1.5 hours for calculations ≤ 1,000,000 digits
+     - 2 hours for calculations ≤ 10,000,000 digits
+     - 2.5 hours for calculations ≤ 100,000,000 digits
+     - 3 hours for calculations ≤ 500,000,000 digits
+     - 4 hours for calculations ≤ 1,000,000,000 digits
+     - 5 hours for calculations ≤ 3,000,000,000 digits
+     - 5.5 hours for calculations ≤ 5,000,000,000 digits
+     - 6 hours for calculations ≤ 6,000,000,000 digits
+     - 7 hours for calculations ≤ 8,000,000,000 digits
+     - 8 hours for calculations ≤ 10,000,000,000 digits
+     - 9 hours for calculations > 10,000,000,000 digits
 
 5. **Segmentation faults**
-   - Enhanced logging now captures more diagnostic information
-   - Check log files for detailed information about any crashes
+   - Enhanced logging now captures comprehensive diagnostic information
+   - Crash logs include timestamps, process ID, memory info, and stack traces
+   - Automatic creation of crash-specific log files with detailed diagnostics
+   - Emergency checkpointing of active calculations during crashes
+   - Platform-specific crash handling for both Linux and macOS
 
 ### Debug Logging
 
@@ -348,8 +383,13 @@ Enable debug logging by modifying the configuration:
 - **Race Condition Protection**: Thread-safe queue management to prevent data corruption
 - **Automatic Resource Cleanup**: Improved temporary file and directory cleanup
 - **Thread Pool Management**: Better handling of thread creation and termination
-- **Graceful Shutdown**: Improved signal handling for clean program termination
-- **Calculation Time Limits**: Automatic timeouts to prevent runaway calculations
+- **Graceful Shutdown**: Improved signal handling with emergency checkpoints and detailed shutdown logs
+- **Calculation Time Limits**: Enhanced timeout system with more granular tiers for larger calculations
+- **Crash Recovery**: Added comprehensive crash logging and state preservation
+- **Platform Compatibility**: Support for both Linux and macOS environments
+- **Error Diagnostics**: Detailed crash logs with system info and stack traces when available
+- **Zero-Value Protection**: Improved handling of zero values in binary splitting algorithm
+- **Job Checkpointing**: Auto-save of job state during crashes and shutdowns
 
 ## License and Attribution
 
