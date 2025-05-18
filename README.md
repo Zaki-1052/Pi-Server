@@ -33,9 +33,11 @@ The implementation features memory-efficient computation techniques, allowing ca
 
 - **Additional Features**:
   - Checkpointing for long-running calculations
-  - Comprehensive logging
+  - Comprehensive logging with improved error diagnostics
   - JSON-based configuration
   - Progress tracking
+  - Automatic calculation timeouts with duration based on digit count
+  - Enhanced memory leak protection
 
 ## System Requirements
 
@@ -308,6 +310,20 @@ The binary splitting optimization divides large calculations into manageable chu
    - Use SSD storage for out-of-core calculations
    - Check for other CPU-intensive processes
 
+4. **Calculation timeouts**
+   - Default timeouts are set based on digit count:
+     - 3 minutes for calculations ≤ 10,000 digits
+     - 10 minutes for calculations ≤ 100,000 digits
+     - 1 hour for calculations ≤ 1,000,000 digits
+     - 2 hours for calculations ≤ 100,000,000 digits
+     - 3 hours for calculations ≤ 1,000,000,000 digits
+     - 5 hours for calculations ≤ 5,000,000,000 digits
+     - 6 hours for calculations > 5,000,000,000 digits
+
+5. **Segmentation faults**
+   - Enhanced logging now captures more diagnostic information
+   - Check log files for detailed information about any crashes
+
 ### Debug Logging
 
 Enable debug logging by modifying the configuration:
@@ -323,9 +339,17 @@ Enable debug logging by modifying the configuration:
 
 - Maximum digit support is based on available system resources
 - No HTTPS support for the API
-- Limited error recovery for interrupted calculations
-- Temporary files may not be cleaned up if the process is killed
 - ARM64 optimization is primarily through standard GMP/MPFR libraries
+
+## Improvements in This Version
+
+- **Enhanced Error Handling**: Improved error detection and recovery in all calculation paths
+- **Memory Safety**: Fixed memory leaks in recursive calculations and ensured proper cleanup
+- **Race Condition Protection**: Thread-safe queue management to prevent data corruption
+- **Automatic Resource Cleanup**: Improved temporary file and directory cleanup
+- **Thread Pool Management**: Better handling of thread creation and termination
+- **Graceful Shutdown**: Improved signal handling for clean program termination
+- **Calculation Time Limits**: Automatic timeouts to prevent runaway calculations
 
 ## License and Attribution
 

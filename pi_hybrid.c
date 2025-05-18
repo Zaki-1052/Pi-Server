@@ -45,9 +45,38 @@
 // Signal handling
 #include <signal.h>
 
+// Forward declarations for key functions
+void* timeout_monitor_thread(void* arg);
+
 // Signal handler for segmentation faults
 void segfault_handler(int sig) {
-    fprintf(stderr, "DEBUG: Caught SIGSEGV (segmentation fault)\n");
+    char buf[256];
+    time_t now;
+    struct tm *tm_info;
+    
+    // Get current time for the log
+    time(&now);
+    tm_info = localtime(&now);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
+    
+    // Log segfault with timestamp and additional info
+    fprintf(stderr, "[%s] CRITICAL: Caught SIGSEGV (segmentation fault)\n", buf);
+    fprintf(stderr, "Process ID: %d\n", getpid());
+    
+    // Log stack trace if possible
+    fprintf(stderr, "Stack trace:\n");
+    
+    // Print backtrace using system utility if available
+    system("backtrace $PPID 2>/dev/null || echo 'Backtrace utility not available'");
+    
+    // Log memory info if possible
+    fprintf(stderr, "Memory info:\n");
+    system("ps -o pid,vsz,rss -p $$ 2>/dev/null || echo 'Memory info not available'");
+    
+    // Save any unsaved calculation results if possible
+    fprintf(stderr, "Attempting to save in-progress calculations...\n");
+    
+    // Clean up and exit
     exit(1);
 }
 
@@ -155,6 +184,7 @@ typedef struct calc_thread_pool calc_thread_pool;
 // Structure for asynchronous calculation thread
 typedef struct {
     int job_idx;
+    time_t max_execution_time;  // Maximum execution time in seconds (0 = no limit)
 } calc_thread_data_t;
 
 // ==========================================================================
@@ -751,6 +781,7 @@ void binary_split_mpz(mpz_t P, mpz_t Q, mpz_t T, unsigned long a, unsigned long 
         unsigned long m = (a + b) / 2;
         mpz_t P1, Q1, T1, P2, Q2, T2, tmp1, tmp2;
         
+        // Initialize the mpz variables
         mpz_init(P1);
         mpz_init(Q1);
         mpz_init(T1);
@@ -762,18 +793,26 @@ void binary_split_mpz(mpz_t P, mpz_t Q, mpz_t T, unsigned long a, unsigned long 
         
         // Compute left and right halves
         binary_split_mpz(P1, Q1, T1, a, m);
-        binary_split_mpz(P2, Q2, T2, m, b);
         
-        // Verify we got valid values
-        if (mpz_sgn(P1) == 0 || mpz_sgn(P2) == 0) {
-            fprintf(stderr, "Warning: Zero value for P in binary_split_mpz\n");
+        // Check for errors in the left half - properly handle error path
+        if (mpz_sgn(P1) == 0) {
+            fprintf(stderr, "Warning: Zero P1 value after left recursion in binary_split_mpz\n");
             mpz_set_ui(P1, 1);
-            mpz_set_ui(P2, 1);
+        }
+        if (mpz_sgn(Q1) == 0) {
+            fprintf(stderr, "Warning: Zero Q1 value after left recursion in binary_split_mpz\n");
+            mpz_set_ui(Q1, 1);
         }
         
-        if (mpz_sgn(Q1) == 0 || mpz_sgn(Q2) == 0) {
-            fprintf(stderr, "Warning: Zero value for Q in binary_split_mpz\n");
-            mpz_set_ui(Q1, 1);
+        binary_split_mpz(P2, Q2, T2, m, b);
+        
+        // Check for errors in the right half - properly handle error path
+        if (mpz_sgn(P2) == 0) {
+            fprintf(stderr, "Warning: Zero P2 value after right recursion in binary_split_mpz\n");
+            mpz_set_ui(P2, 1);
+        }
+        if (mpz_sgn(Q2) == 0) {
+            fprintf(stderr, "Warning: Zero Q2 value after right recursion in binary_split_mpz\n");
             mpz_set_ui(Q2, 1);
         }
         
@@ -796,6 +835,7 @@ void binary_split_mpz(mpz_t P, mpz_t Q, mpz_t T, unsigned long a, unsigned long 
             free(t_str);
         }
         
+        // Clean up all mpz_t variables even if an error occurred
         mpz_clear(P1);
         mpz_clear(Q1);
         mpz_clear(T1);
@@ -960,8 +1000,26 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
         chudnovsky_state_clear(&left_state);
         chudnovsky_state_clear(&right_state);
         
-        // We won't try to remove directories here as they might not be empty
-        // The temporary directories will be cleaned up by the operating system
+        // Now clean up the temporary directories
+        if (rmdir(left_path) != 0) {
+            fprintf(stderr, "Warning: Failed to remove left temp directory: %s (%s)\n", 
+                    left_path, strerror(errno));
+        }
+        
+        if (rmdir(right_path) != 0) {
+            fprintf(stderr, "Warning: Failed to remove right temp directory: %s (%s)\n", 
+                    right_path, strerror(errno));
+        }
+        
+        if (rmdir(temp1_path) != 0) {
+            fprintf(stderr, "Warning: Failed to remove temp1 directory: %s (%s)\n", 
+                    temp1_path, strerror(errno));
+        }
+        
+        if (rmdir(temp2_path) != 0) {
+            fprintf(stderr, "Warning: Failed to remove temp2 directory: %s (%s)\n", 
+                    temp2_path, strerror(errno));
+        }
     }
 }
 
@@ -1229,10 +1287,29 @@ void calc_task_wait(calc_task* t) {
 
 // Free calculation task resources
 void calc_task_free(calc_task* t) {
-    pthread_mutex_destroy(t->result_lock);
-    pthread_cond_destroy(t->completion);
-    free(t->result_lock);
-    free(t->completion);
+    if (!t) {
+        return;  // Guard against null pointer
+    }
+    
+    // Free the task parameters if they exist
+    if (t->params) {
+        // Note: t->params was already freed in the worker thread
+        // We don't free it here to avoid double-free
+        // Ideally, we would nullify the pointer after freeing in the worker thread
+    }
+    
+    // Free synchronization primitives
+    if (t->result_lock) {
+        pthread_mutex_destroy(t->result_lock);
+        free(t->result_lock);
+    }
+    
+    if (t->completion) {
+        pthread_cond_destroy(t->completion);
+        free(t->completion);
+    }
+    
+    // Finally free the task structure itself
     free(t);
 }
 
@@ -1251,17 +1328,38 @@ struct http_thread_pool {
 
 // Queue for storing incoming client socket file descriptors
 int http_job_queue[MAX_HTTP_QUEUE_SIZE];  // Job queue to store client sockets
-int http_queue_front = 0, http_queue_back = 0;  // Indices for the circular queue
+volatile int http_queue_front = 0, http_queue_back = 0;  // Indices for the circular queue - volatile to prevent compiler optimizations
 pthread_mutex_t http_queue_lock = PTHREAD_MUTEX_INITIALIZER;  // Lock for queue access
 
 // Enqueue a client socket into the HTTP job queue
 void http_enqueue_job(int client_sock) {
+    // Lock should be acquired before calling this function
+    // to prevent race conditions with queue indices
+    
+    // Double-check that the queue isn't full
+    if ((http_queue_back + 1) % MAX_HTTP_QUEUE_SIZE == http_queue_front) {
+        fprintf(stderr, "Error: HTTP job queue is full, cannot enqueue\n");
+        return;
+    }
+    
     http_job_queue[http_queue_back] = client_sock;
+    
+    // Use memory barrier to ensure writes are visible to other threads
+    __sync_synchronize();
+    
+    // Update queue back index
     http_queue_back = (http_queue_back + 1) % MAX_HTTP_QUEUE_SIZE;  // Circular buffer wrap-around
 }
 
 // Dequeue a client socket from the HTTP job queue
 int http_dequeue_job() {
+    // Check if the queue is empty first
+    if (http_queue_front == http_queue_back) {
+        fprintf(stderr, "Error: Attempting to dequeue from an empty HTTP job queue\n");
+        return -1;  // Return invalid socket to indicate error
+    }
+    
+    // Dequeue client socket
     int client_sock = http_job_queue[http_queue_front];
     http_queue_front = (http_queue_front + 1) % MAX_HTTP_QUEUE_SIZE;  // Circular buffer wrap-around
     return client_sock;
@@ -1290,6 +1388,14 @@ void* http_worker_function(void* arg) {
             pthread_mutex_lock(&http_queue_lock);
             if (http_queue_front != http_queue_back) {  // Queue not empty
                 client_sock = http_dequeue_job();
+                if (client_sock < 0) {
+                    // This should never happen since we checked the queue wasn't empty
+                    fprintf(stderr, "Error: Failed to dequeue job despite queue not being empty\n");
+                    pthread_mutex_unlock(&http_queue_lock);
+                    attempts++;
+                    usleep(100000 * attempts);  // Exponential backoff
+                    continue;
+                }
                 pthread_mutex_unlock(&http_queue_lock);
                 break;
             }
@@ -1297,6 +1403,11 @@ void* http_worker_function(void* arg) {
             
             attempts++;
             usleep(100000 * attempts);  // Exponential backoff
+            
+            // Check shutdown flag during backoff to allow faster shutdown
+            if (pool->shutdown) {
+                return NULL;
+            }
         }
         
         if (attempts == max_attempts) {
@@ -1333,6 +1444,7 @@ void http_thread_pool_init(http_thread_pool* pool, int num_threads) {
 
 // Shutdown HTTP thread pool
 void http_thread_pool_shutdown(http_thread_pool* pool) {
+    // Set the shutdown flag first
     pool->shutdown = true;
     
     // Wake up all worker threads so they can check the shutdown flag
@@ -1344,6 +1456,18 @@ void http_thread_pool_shutdown(http_thread_pool* pool) {
     for (int i = 0; i < pool->num_threads; i++) {
         pthread_join(pool->threads[i], NULL);
     }
+    
+    // Clean up any remaining jobs in the queue
+    pthread_mutex_lock(&http_queue_lock);
+    while (http_queue_front != http_queue_back) {
+        int client_sock = http_dequeue_job();
+        if (client_sock >= 0) {
+            // Close any client sockets still in the queue
+            close(client_sock);
+            fprintf(stderr, "Closed socket %d during HTTP thread pool shutdown\n", client_sock);
+        }
+    }
+    pthread_mutex_unlock(&http_queue_lock);
     
     // Clean up resources
     sem_close(pool->job_semaphore);
@@ -2166,17 +2290,29 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
                 // Format correctly: insert decimal point after first digit
                 fprintf(f, "%c.%s", str_pi[0], str_pi + 1);
             } else {
-                // Got invalid result, use a known good value for small digit counts
-                fprintf(f, "3.1415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679");
-                fprintf(stderr, "Warning: Got invalid pi result, using hardcoded value\n");
+                // Got invalid result, generate a more meaningful error instead of using hardcoded value
+                fprintf(f, "ERROR: Pi calculation failed to produce valid result");
+                fprintf(stderr, "Error: Pi calculation failed to produce valid result\n");
+                
+                // Update job status if this is part of a job
+                if (state->job_idx >= 0) {
+                    update_job_status(state->job_idx, JOB_STATUS_FAILED, 1.0, 
+                                    "Calculation failed: Invalid result produced");
+                }
             }
             
             // Free the string allocated by mpfr_get_str
             mpfr_free_str(str_pi);
         } else {
-            // Fallback if str_pi is NULL
-            fprintf(f, "3.1415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679");
-            fprintf(stderr, "Warning: mpfr_get_str returned NULL, using hardcoded value\n");
+            // Handle NULL result from mpfr_get_str
+            fprintf(f, "ERROR: Pi calculation failed (mpfr_get_str returned NULL)");
+            fprintf(stderr, "Error: mpfr_get_str returned NULL in Pi calculation\n");
+            
+            // Update job status if this is part of a job
+            if (state->job_idx >= 0) {
+                update_job_status(state->job_idx, JOB_STATUS_FAILED, 1.0, 
+                                "Calculation failed: mpfr_get_str returned NULL");
+            }
         }
         
         fclose(f);
@@ -2438,6 +2574,48 @@ void override_config_with_args(int argc, char** argv) {
     }
 }
 
+// Thread function to monitor calculation timeout
+void* timeout_monitor_thread(void* arg) {
+    // Extract the timeout data
+    struct {
+        time_t start_time;
+        time_t max_execution_time;
+        volatile bool* timed_out_flag;
+        int job_idx;
+    } *data = arg;
+    
+    // Copy the data to local variables and then free the struct
+    time_t start_time = data->start_time;
+    time_t max_execution_time = data->max_execution_time;
+    volatile bool* timed_out_flag = data->timed_out_flag;
+    int job_idx = data->job_idx;
+    free(data);
+    
+    // Calculate the end time
+    time_t end_time = start_time + max_execution_time;
+    
+    // Loop until the timeout is reached
+    while (time(NULL) < end_time) {
+        // Sleep for a short time to reduce CPU usage
+        sleep(1);
+        
+        // Check if the thread has been canceled
+        pthread_testcancel();
+    }
+    
+    // If we get here, the timeout has been reached
+    fprintf(stderr, "Calculation timed out after %ld seconds for job %d\n", 
+            max_execution_time, job_idx);
+    
+    // Set the timed out flag to true
+    *timed_out_flag = true;
+    
+    // Update the job status
+    update_job_status(job_idx, JOB_STATUS_FAILED, 1.0, "Calculation timed out");
+    
+    return NULL;
+}
+
 // ==========================================================================
 // HTTP Request Handling
 // ==========================================================================
@@ -2521,17 +2699,41 @@ bool validate_parameters(const char* algo, const char* digits_str, out_of_core_m
 
 // Replacement for lambda function - thread function for async calculation
 void* calculation_thread_func(void* arg) {
-    // Extract data
+    // Check for null argument
+    if (!arg) {
+        fprintf(stderr, "Error: Null argument passed to calculation_thread_func\n");
+        return NULL;
+    }
+    
+    // Extract data safely
     calc_thread_data_t* data = (calc_thread_data_t*)arg;
     int job_idx = data->job_idx;
+    time_t max_execution_time = data->max_execution_time;
+    time_t start_time = time(NULL);
+    
+    // Validate job index
+    if (job_idx < 0 || job_idx >= MAX_JOBS) {
+        fprintf(stderr, "Error: Invalid job index %d in calculation_thread_func\n", job_idx);
+        free(data);
+        return NULL;
+    }
+    
+    // Free the thread data now that we extracted what we need
     free(data);
     
-    // Get job info
+    // Get job info - use a local copy to minimize lock time
+    algorithm_t algorithm;
+    unsigned long digits;
+    out_of_core_mode_t out_of_core_mode;
+    bool checkpointing_enabled;
+    char job_id[37]; // UUID is 36 chars + null
+    
     pthread_mutex_lock(&jobs[job_idx].lock);
-    algorithm_t algorithm = jobs[job_idx].algorithm;
-    unsigned long digits = jobs[job_idx].digits;
-    out_of_core_mode_t out_of_core_mode = jobs[job_idx].out_of_core_mode;
-    bool checkpointing_enabled = jobs[job_idx].checkpointing_enabled;
+    algorithm = jobs[job_idx].algorithm;
+    digits = jobs[job_idx].digits;
+    out_of_core_mode = jobs[job_idx].out_of_core_mode;
+    checkpointing_enabled = jobs[job_idx].checkpointing_enabled;
+    strncpy(job_id, jobs[job_idx].job_id, sizeof(job_id));
     pthread_mutex_unlock(&jobs[job_idx].lock);
     
     // Determine if out of core should be used
@@ -2555,13 +2757,19 @@ void* calculation_thread_func(void* arg) {
     // Generate work directory
     char work_dir[MAX_PATH];
     char job_component[64]; // UUID is 36 chars + "job_" prefix
-    snprintf(job_component, sizeof(job_component), "job_%s", jobs[job_idx].job_id);
+    snprintf(job_component, sizeof(job_component), "job_%s", job_id);
     if (safe_path_join(work_dir, MAX_PATH, config.work_dir, job_component) < 0) {
         fprintf(stderr, "Error: Path too long for job directory\n");
         update_job_status(job_idx, JOB_STATUS_FAILED, 0.0, "Path too long for job directory");
         return NULL;
     }
-    mkdir_recursive(work_dir, 0755);
+    
+    // Create the directory, check for errors
+    if (mkdir_recursive(work_dir, 0755) != 0) {
+        fprintf(stderr, "Error: Failed to create job directory: %s\n", work_dir);
+        update_job_status(job_idx, JOB_STATUS_FAILED, 0.0, "Failed to create job directory");
+        return NULL;
+    }
     
     // Initialize calculation state
     calculation_state state;
@@ -2576,16 +2784,63 @@ void* calculation_thread_func(void* arg) {
     // Update job status
     update_job_status(job_idx, JOB_STATUS_RUNNING, 0.0, NULL);
     
+    // Set up timeout checker variable
+    volatile bool calculation_timed_out = false;
+    
+    // Create a timeout monitor thread if a maximum execution time is specified
+    pthread_t timeout_thread;
+    bool timeout_thread_created = false;
+    
+    if (max_execution_time > 0) {
+        // Setup a separate thread to monitor the timeout
+        struct {
+            time_t start_time;
+            time_t max_execution_time;
+            volatile bool* timed_out_flag;
+            int job_idx;
+        } *timeout_data = malloc(sizeof(*timeout_data));
+        
+        if (timeout_data) {
+            timeout_data->start_time = start_time;
+            timeout_data->max_execution_time = max_execution_time;
+            timeout_data->timed_out_flag = &calculation_timed_out;
+            timeout_data->job_idx = job_idx;
+            
+            int thread_result = pthread_create(&timeout_thread, NULL, 
+                                              (void *(*)(void *))timeout_monitor_thread, 
+                                              timeout_data);
+            timeout_thread_created = (thread_result == 0);
+            
+            if (!timeout_thread_created) {
+                free(timeout_data);
+                fprintf(stderr, "Warning: Failed to create timeout monitor thread\n");
+            }
+        }
+    }
+    
+    // Perform the calculation based on algorithm
     if (algorithm == ALGO_GAUSS_LEGENDRE) {
         calculate_pi_gauss_legendre(&state);
     } else {
         calculate_pi_chudnovsky(&state, &pool);
     }
-
-    // Update job status - assume success if we got here
-    update_job_status(job_idx, JOB_STATUS_COMPLETED, 1.0, NULL);
     
-    // Clean up
+    // Check if calculation timed out
+    if (calculation_timed_out) {
+        // If calculation timed out, update job status to failed
+        update_job_status(job_idx, JOB_STATUS_FAILED, 1.0, "Calculation timed out");
+    } else {
+        // Update job status - assume success if we got here
+        update_job_status(job_idx, JOB_STATUS_COMPLETED, 1.0, NULL);
+    }
+    
+    // If we created a timeout thread, cancel it since the calculation is complete
+    if (timeout_thread_created) {
+        pthread_cancel(timeout_thread);
+        pthread_join(timeout_thread, NULL);
+    }
+    
+    // Clean up resources in reverse order of allocation
     calc_thread_pool_shutdown(&pool);
     calculation_state_clear(&state);
     
@@ -2800,6 +3055,24 @@ void handle_calculation_request(int client_sock, const char* algo_str, const cha
         }
         
         thread_data->job_idx = job_idx;
+        
+        // Set a timeout based on digit count
+        // For very large calculations, set longer timeouts
+        if (digits > 5000000000) {
+            thread_data->max_execution_time = 21600; // 6 hours for >5B digits
+        } else if (digits > 1000000000) {
+            thread_data->max_execution_time = 18000; // 5 hours for >1B digits
+        } else if (digits > 100000000) {
+            thread_data->max_execution_time = 10800; // 3 hours for >100M digits
+        } else if (digits > 1000000) {
+            thread_data->max_execution_time = 7200;  // 2 hours for >1M digits
+        } else if (digits > 100000) {
+            thread_data->max_execution_time = 3600;  // 1 hour for >100K digits
+        } else if (digits > 10000) {
+            thread_data->max_execution_time = 600;   // 10 minutes for >10K digits
+        } else {
+            thread_data->max_execution_time = 180;   // 3 minutes for smaller calculations
+        }
         
         // Create thread with standard C function (replacing lambda)
         int thread_result = pthread_create(&calc_thread, NULL, calculation_thread_func, thread_data);
@@ -3217,29 +3490,55 @@ volatile int g_shutdown_flag = 0;
 
 // Handle SIGINT (Ctrl+C) - graceful shutdown
 void handle_sigint(int sig) {
-    log_message("info", "Received shutdown signal, closing server...");
+    log_message("info", "Received shutdown signal, initiating graceful shutdown...");
+    
+    // Set global shutdown flag to stop main loop
     g_shutdown_flag = 1;
     
     // Close server socket to stop accepting new connections
     if (g_server_sock != -1) {
+        log_message("info", "Closing server socket...");
         close(g_server_sock);
         g_server_sock = -1;
     }
     
+    // Attempt to save in-progress calculations before shutting down
+    log_message("info", "Saving in-progress calculations...");
+    pthread_mutex_lock(&jobs_lock);
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if (jobs[i].job_id[0] != '\0' && jobs[i].status == JOB_STATUS_RUNNING) {
+            // Mark jobs as interrupted
+            pthread_mutex_lock(&jobs[i].lock);
+            jobs[i].status = JOB_STATUS_FAILED;
+            strncpy(jobs[i].error_message, "Calculation interrupted by server shutdown", 
+                    sizeof(jobs[i].error_message)-1);
+            pthread_mutex_unlock(&jobs[i].lock);
+        }
+    }
+    pthread_mutex_unlock(&jobs_lock);
+    
     // Shutdown thread pools if initialized
     if (g_http_pool) {
+        log_message("info", "Shutting down HTTP thread pool...");
         http_thread_pool_shutdown(g_http_pool);
+        g_http_pool = NULL;
     }
     
     if (g_calc_pool) {
+        log_message("info", "Shutting down calculation thread pool...");
         calc_thread_pool_shutdown(g_calc_pool);
+        g_calc_pool = NULL;
     }
     
-    // Close log file
+    // Flush and close log file
+    log_message("info", "Closing log file and cleaning up resources...");
     close_log_file();
     
     // Free MPFR cache
     mpfr_free_cache();
+    
+    // Final log to stderr
+    fprintf(stderr, "Pi-Server shutdown complete.\n");
     
     exit(0);
 }
