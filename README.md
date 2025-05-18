@@ -121,7 +121,7 @@ The server can be configured using a JSON configuration file:
 | `default_algorithm` | Default algorithm (`GL` or `CH`) | `GL` |
 | `gl_iterations` | Iterations for Gauss-Legendre | `10` |
 | `gl_precision_bits` | Extra precision bits for calculations | `128` |
-| `logging.level` | Logging level (debug, info, error) | `info` |
+| `logging.level` | Logging level (debug, info, warning, error, critical) | `info` |
 | `logging.output` | Log output (console or file path) | `console` |
 | `work_dir` | Working directory for calculations | `./pi_calc` |
 | `checkpointing_enabled` | Enable calculation checkpoints | `true` |
@@ -426,8 +426,22 @@ Other limitations:
 - **Zero-Value Protection**: Improved handling of zero values in binary splitting algorithm
 - **Job Checkpointing**: Auto-save of job state during crashes and shutdowns
 
-## Latest Fixes (June 2025)
+## Latest Fixes (May 2025)
 
+- **Fixed Chudnovsky Formula Implementation**: Corrected mathematical formula by adding the crucial factor of 12 in the denominator for proper Pi calculation
+- **Improved Small-Digit Approach**: Completely revamped small-digit calculations (≤1000 digits) to use binary splitting for more accurate and consistent results
+- **Enhanced Crash Recovery**: Implemented fork-based crash handling that properly captures and logs diagnostic information during segmentation faults
+- **Fixed Memory Management Issues**:
+  - Corrected chunk deletion logic to properly track and remove temporary files
+  - Eliminated memory leak in thread pool management
+  - Improved resource cleanup across all operations
+- **Eliminated Race Conditions**: 
+  - Addressed potential deadlocks in disk integer comparison operations
+  - Implemented consistent lock acquisition ordering based on memory addresses
+- **Standardized Logging System**: 
+  - Created unified logging infrastructure that works across all modes
+  - Expanded log levels (debug, info, warning, error, critical)
+  - Consistent formatting and output control for both console and file logging
 - **Complete Sign Handling**: Implemented robust sign handling for all arithmetic operations through new comparison and subtraction functions
 - **Ultra-Efficient Cross-Platform Multiplication**: 
   - ARM64: Optimized multiplication using native `mul` and `umulh` instructions
