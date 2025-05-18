@@ -3654,38 +3654,63 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         printf("Q size: %zu digits\n", mpz_sizeinbase(Q, 10));
         printf("T size: %zu digits\n", mpz_sizeinbase(T, 10));
         
-        // Compute pi using the correct Chudnovsky formula: pi = (426880 * sqrt(10005)) / (P * (13591409 + 545140134 * n))
-        mpfr_t pi, temp_sqrt, temp_div, temp_mul, temp_add;
+        // Compute pi using the exact steps from the gmp-chudnovsky.c reference implementation
+        mpfr_t pi, qi, sqrt_c;
         mpfr_prec_t precision = (mpfr_prec_t)(state->digits * 4);
         
         // Initialize MPFR variables
-        mpfr_init2(pi, precision);          // Final pi value
-        mpfr_init2(temp_sqrt, precision);   // For sqrt(10005)
-        mpfr_init2(temp_div, precision);    // For denominator
-        mpfr_init2(temp_mul, precision);    // For numerator
-        mpfr_init2(temp_add, precision);    // For Q+A*P
+        mpfr_init2(pi, precision);
+        mpfr_init2(qi, precision);
+        mpfr_init2(sqrt_c, precision);
         
-        // Initialize constants
-        mpfr_t mpfr_C;
-        mpfr_init2(mpfr_C, precision);  // C = 640320
+        // Make a copy of our P and Q values to modify
+        mpz_t p1, q1;
+        mpz_init(p1);
+        mpz_init(q1);
+        mpz_set(p1, P);
+        mpz_set(q1, T); // In our representation, T is used as q1 in the reference
         
-        // Set constant values
-        mpfr_set_ui(mpfr_C, C, MPFR_RNDN);
+        // Debug output
+        char *p_str = mpz_get_str(NULL, 10, p1);
+        char *q_str = mpz_get_str(NULL, 10, q1);
+        if (p_str && q_str) {
+            printf("Before final calculation: p1=%s, q1=%s\n", p_str, q_str);
+            free(p_str);
+            free(q_str);
+        }
         
-        // Calculate numerator: 426880 * sqrt(10005)
-        mpfr_set_ui(temp_sqrt, 10005, MPFR_RNDN);
-        mpfr_sqrt(temp_sqrt, temp_sqrt, MPFR_RNDN);
-        mpfr_set_ui(temp_mul, 426880, MPFR_RNDN);
-        mpfr_mul(temp_mul, temp_mul, temp_sqrt, MPFR_RNDN);
+        // Step 1: Add A*p1 to q1 (q1 = q1 + A*p1)
+        mpz_addmul_ui(q1, p1, A);
         
-        // Calculate denominator: Q + A*P
-        mpfr_set_z(temp_add, P, MPFR_RNDN);           // temp_add = P
-        mpfr_mul_ui(temp_add, temp_add, A, MPFR_RNDN); // temp_add = A*P
-        mpfr_set_z(temp_div, Q, MPFR_RNDN);           // temp_div = Q
-        mpfr_add(temp_div, temp_div, temp_add, MPFR_RNDN); // temp_div = Q + A*P
+        // Step 2: Multiply p1 by C/D (p1 = p1 * C/D)
+        mpz_mul_ui(p1, p1, C/12); // D = 12
         
-        // Final division: pi = (426880 * sqrt(10005)) / (Q + A*P)
-        mpfr_div(pi, temp_mul, temp_div, MPFR_RNDN);
+        // Debug output after modifications
+        p_str = mpz_get_str(NULL, 10, p1);
+        q_str = mpz_get_str(NULL, 10, q1);
+        if (p_str && q_str) {
+            printf("After modifications: p1=%s, q1=%s\n", p_str, q_str);
+            free(p_str);
+            free(q_str);
+        }
+        
+        // Step 3: Convert to floating point
+        mpfr_set_z(pi, p1, MPFR_RNDN);  // pi = p1
+        mpfr_set_z(qi, q1, MPFR_RNDN);  // qi = q1
+        
+        // Step 4: Calculate sqrt(C)
+        mpfr_set_ui(sqrt_c, C, MPFR_RNDN);
+        mpfr_sqrt(sqrt_c, sqrt_c, MPFR_RNDN);
+        
+        // Step 5: Divide pi by qi (pi = pi / qi)
+        mpfr_div(pi, pi, qi, MPFR_RNDN);
+        
+        // Step 6: Multiply by sqrt(C) (pi = pi * sqrt(C))
+        mpfr_mul(pi, pi, sqrt_c, MPFR_RNDN);
+        
+        // Clear the temporary mpz variables
+        mpz_clear(p1);
+        mpz_clear(q1);
         
         // Print final value for verification
         mpfr_printf("Final pi value: %.10Rf\n", pi);
@@ -3717,11 +3742,8 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         mpz_clear(Q);
         mpz_clear(T);
         mpfr_clear(pi);
-        mpfr_clear(temp_sqrt);
-        mpfr_clear(temp_div);
-        mpfr_clear(temp_mul);
-        mpfr_clear(temp_add);
-        mpfr_clear(mpfr_C);
+        mpfr_clear(qi);
+        mpfr_clear(sqrt_c);
         
         printf("Pi calculation complete! Result saved to %s\n", state->output_file);
         return;
