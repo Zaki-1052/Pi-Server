@@ -25,7 +25,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <stdarg.h>
-
+#include <stdint.h>
 // Networking libraries
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -1019,6 +1019,9 @@ void disk_int_get_mpz(mpz_t mpz_val, disk_int* d_int) {
 // Compare the absolute values of two disk integers
 // Returns: 1 if |a| > |b|, 0 if |a| == |b|, -1 if |a| < |b|
 int disk_int_cmp_abs(disk_int* a, disk_int* b) {
+    if (a == b) {
+        return 0; // An object is always equal to itself in magnitude
+    }
     // First check if either a or b is zero (without locks)
     if (a->total_size_in_limbs == 0 || a->sign == 0) {
         if (b->total_size_in_limbs == 0 || b->sign == 0) {
