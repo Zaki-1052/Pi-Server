@@ -4265,13 +4265,9 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
             disk_int_add(&temp_T, &temp_T1, &temp_T2);
             disk_int_get_mpz(mpz_temp_T, &temp_T);
             
-            // Now clear current results
-            // Update combined state
-            disk_int_clear(&combined_state.P);
-            disk_int_clear(&combined_state.Q);
-            disk_int_clear(&combined_state.T);
-            
-            // Set new values to combined state
+            // Update combined state directly WITHOUT clearing first
+            // This is the fix for the bug where disk integers were cleared before setting new values
+            // Since combined_state.P, Q, T were already initialized, we can directly set new values
             disk_int_set_mpz(&combined_state.P, mpz_temp_P);
             disk_int_set_mpz(&combined_state.Q, mpz_temp_Q);
             disk_int_set_mpz(&combined_state.T, mpz_temp_T);
@@ -4392,14 +4388,14 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         update_job_status(state->job_idx, JOB_STATUS_RUNNING, 0.9, NULL);  // 90% progress
     }
     
-    // Pi = (C³/24) * P / (Q+A*P) * √C  - Correct Chudnovsky formula
-    mpz_t mpz_P, mpz_Q, mpz_T, mpz_sum;
-    mpfr_t mpfr_pi, mpfr_C, mpfr_temp, mpfr_temp2, mpfr_C3_24;
+    // Pi = (P * C * sqrt(C)) / (12 * T) - Correct Chudnovsky formula
+    // Based on reference implementation in gmp-chudnovsky.c
+    mpz_t mpz_P, mpz_Q, mpz_T;
+    mpfr_t mpfr_pi, mpfr_C, mpfr_temp, mpfr_P_val, mpfr_T_val, mpfr_sqrt_C, mpfr_const_12;
     
     mpz_init(mpz_P);
     mpz_init(mpz_Q);
     mpz_init(mpz_T);
-    mpz_init(mpz_sum);
     
     // Determine required precision
     mpfr_prec_t precision = (mpfr_prec_t)(state->digits * 4);
@@ -4407,8 +4403,10 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     mpfr_init2(mpfr_pi, precision);
     mpfr_init2(mpfr_C, precision);
     mpfr_init2(mpfr_temp, precision);
-    mpfr_init2(mpfr_temp2, precision);
-    mpfr_init2(mpfr_C3_24, precision);
+    mpfr_init2(mpfr_P_val, precision);
+    mpfr_init2(mpfr_T_val, precision);
+    mpfr_init2(mpfr_sqrt_C, precision);
+    mpfr_init2(mpfr_const_12, precision);
     
     // Reset values to safe defaults first
     mpz_set_ui(mpz_P, 1);
