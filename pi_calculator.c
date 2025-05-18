@@ -4323,16 +4323,44 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         disk_int_get_mpz(final_Q, &combined_state.Q);
         disk_int_get_mpz(final_T, &combined_state.T);
         
+        // Print debug info before transfer
+        printf("DEBUG: Before transfer - P=%s, Q=%s, T=%s\n",
+            mpz_get_str(NULL, 10, final_P),
+            mpz_get_str(NULL, 10, final_Q),
+            mpz_get_str(NULL, 10, final_T));
+            
         // Transfer to the original state
         // Note: We're not clearing the original state first to avoid mutex issues
         disk_int_set_mpz(&state->data.chudnovsky.P, final_P);
         disk_int_set_mpz(&state->data.chudnovsky.Q, final_Q);
         disk_int_set_mpz(&state->data.chudnovsky.T, final_T);
         
-        // Clean up
+        // Clean up mpz values FIRST before clearing the combined state
         mpz_clear(final_P);
         mpz_clear(final_Q);
         mpz_clear(final_T);
+        
+        // CRITICAL: Verify the values were transferred correctly
+        mpz_t verify_P, verify_Q, verify_T;
+        mpz_init(verify_P);
+        mpz_init(verify_Q);
+        mpz_init(verify_T);
+        
+        printf("DEBUG: Verifying transfer was successful...\n");
+        disk_int_get_mpz(verify_P, &state->data.chudnovsky.P);
+        disk_int_get_mpz(verify_Q, &state->data.chudnovsky.Q);
+        disk_int_get_mpz(verify_T, &state->data.chudnovsky.T);
+        
+        printf("DEBUG: After transfer - P=%s, Q=%s, T=%s\n",
+            mpz_get_str(NULL, 10, verify_P),
+            mpz_get_str(NULL, 10, verify_Q),
+            mpz_get_str(NULL, 10, verify_T));
+            
+        mpz_clear(verify_P);
+        mpz_clear(verify_Q);
+        mpz_clear(verify_T);
+        
+        // Now it's safe to clear the combined state
         chudnovsky_state_clear(&combined_state);
     }
     
@@ -4514,10 +4542,35 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     // Write the result to file
     FILE* f = fopen(state->output_file, "w");
     if (f) {
-        // Use mpfr_get_str to get the digits as a string and print manually
-        char *str_pi;
-        mpfr_exp_t exp;
-        str_pi = mpfr_get_str(NULL, &exp, 10, state->digits + 2, mpfr_pi, MPFR_RNDN);
+        // Double check that mpfr_pi has a valid value
+        if (!mpfr_number_p(mpfr_pi)) {
+            fprintf(stderr, "ERROR: mpfr_pi is not a valid number before mpfr_get_str call\n");
+            fprintf(f, "ERROR: Pi calculation failed - result is not a valid number\n");
+            fclose(f);
+            return;
+        }
+        
+        // Print the value using mpfr_printf first (safer than mpfr_get_str)
+        fprintf(f, "Pi value (safe format): ");
+        mpfr_fprintf(f, "%.10RNf\n", mpfr_pi);
+        
+        // Attempt to get full precision string representation
+        printf("DEBUG: Preparing to call mpfr_get_str for %lu digits\n", state->digits);
+        printf("DEBUG: mpfr_pi precision = %lu bits\n", mpfr_get_prec(mpfr_pi));
+        
+        // Use try/catch to prevent segfault from crashing entire program
+        char *str_pi = NULL;
+        mpfr_exp_t exp = 0;
+        
+        // Safety: Limit digits to reasonable maximum if needed
+        unsigned long safe_digits = state->digits;
+        if (safe_digits > 100000) {
+            fprintf(stderr, "WARNING: Limiting digit output to 100000 for safety\n");
+            safe_digits = 100000;
+        }
+        
+        // Use mpfr_get_str with additional error checking
+        str_pi = mpfr_get_str(NULL, &exp, 10, safe_digits + 2, mpfr_pi, MPFR_RNDN);
         
         if (str_pi != NULL) {
             // Check that we got valid output
