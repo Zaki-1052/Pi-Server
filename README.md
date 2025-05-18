@@ -406,7 +406,7 @@ New version with true out-of-core arithmetic:
 
 Other limitations:
 - No HTTPS support for the API
-- ARM64 optimization is primarily through standard GMP/MPFR libraries
+- ARM64-specific optimizations for limb multiplication and other core arithmetic operations
 
 ## Improvements in This Version
 
@@ -425,6 +425,14 @@ Other limitations:
 - **Error Diagnostics**: Detailed crash logs with system info and stack traces when available
 - **Zero-Value Protection**: Improved handling of zero values in binary splitting algorithm
 - **Job Checkpointing**: Auto-save of job state during crashes and shutdowns
+
+## Latest Fixes (May 2025)
+
+- **ARM64-Optimized Multiplication**: Implemented specialized ARM64 instructions for multiplying limbs with full precision using native `mul` and `umulh` operations
+- **Double-Width Product Handling**: Correctly handling full-precision (128-bit) products in limb-by-limb multiplication for accurate arbitrary-precision calculations
+- **Enhanced Carry Propagation**: Improved carry handling logic in chunked arithmetic operations with robust propagation across chunk boundaries
+- **Cross-Platform Computation**: Added optimized fallback implementation for non-ARM64 platforms ensuring consistent results across all systems
+- **Precise Size Tracking**: Improved accuracy of result size determination based on most significant non-zero limbs
 
 ## License and Attribution
 

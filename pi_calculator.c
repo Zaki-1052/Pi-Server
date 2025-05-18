@@ -1289,20 +1289,22 @@ cleanup:
 
 // Helper function to add product of two chunks to result at specified position
 void add_product_to_result(disk_int* result, mp_limb_t* product, size_t product_size, size_t position) {
-    // We need to load chunks from the result, add the product, and save back
-    // This is a simplified version - in a real implementation, we'd need to handle carries across chunks
+    // Enhanced implementation for adding product to result with robust carry handling
+    // This implementation properly handles large intermediate products and carries
     
     // Determine which chunk to start with
     size_t start_chunk = position / result->chunk_size;
     size_t offset_in_chunk = position % result->chunk_size;
     
     // Calculate how many chunks we need to update
+    // We might need one more chunk for final carry
     size_t chunks_needed = (offset_in_chunk + product_size + result->chunk_size - 1) / result->chunk_size;
     
-    // Prepare for carry handling
+    // Prepare for carry handling - using a full limb for carry
     mp_limb_t carry = 0;
     size_t product_idx = 0;
     
+    // Process each chunk
     for (size_t i = 0; i < chunks_needed; i++) {
         size_t current_chunk = start_chunk + i;
         
@@ -1324,20 +1326,41 @@ void add_product_to_result(disk_int* result, mp_limb_t* product, size_t product_
         
         // Add product to this chunk with carry
         for (size_t j = 0; j < limbs_to_add; j++) {
-            mp_limb_t sum = ((mp_limb_t*)result->cache)[start_pos + j] + product[product_idx] + carry;
+            // Add the current limb to the result
+            mp_limb_t old_val = ((mp_limb_t*)result->cache)[start_pos + j];
+            mp_limb_t prod_val = product[product_idx];
             
-            // Check for overflow
-            carry = (sum < ((mp_limb_t*)result->cache)[start_pos + j]) || 
-                   (sum == ((mp_limb_t*)result->cache)[start_pos + j] && (product[product_idx] > 0 || carry > 0));
+            // First add carry to the result limb
+            mp_limb_t sum = old_val + carry;
+            mp_limb_t carry1 = (sum < old_val) ? 1 : 0;
             
-            ((mp_limb_t*)result->cache)[start_pos + j] = sum;
+            // Then add product value to sum
+            mp_limb_t new_sum = sum + prod_val;
+            mp_limb_t carry2 = (new_sum < sum) ? 1 : 0;
+            
+            // Total carry is the combination of both carries
+            carry = carry1 + carry2;
+            
+            // Store the result
+            ((mp_limb_t*)result->cache)[start_pos + j] = new_sum;
             product_idx++;
         }
         
-        // If we still have carry and room in this chunk, add it
-        if (carry && start_pos + limbs_to_add < result->chunk_size) {
-            ((mp_limb_t*)result->cache)[start_pos + limbs_to_add] += carry;
-            carry = 0;
+        // If we still have carry and room in this chunk, propagate the carry
+        if (carry > 0 && start_pos + limbs_to_add < result->chunk_size) {
+            // Continue carry propagation within the current chunk
+            size_t k = start_pos + limbs_to_add;
+            while (carry > 0 && k < result->chunk_size) {
+                mp_limb_t old_val = ((mp_limb_t*)result->cache)[k];
+                mp_limb_t new_val = old_val + carry;
+                
+                // Update carry if we wrapped around
+                carry = (new_val < old_val) ? 1 : 0;
+                
+                // Store the updated value
+                ((mp_limb_t*)result->cache)[k] = new_val;
+                k++;
+            }
         }
         
         // Save this chunk
@@ -1348,49 +1371,77 @@ void add_product_to_result(disk_int* result, mp_limb_t* product, size_t product_
         }
     }
     
-    // Handle final carry if any
-    while (carry > 0 && start_chunk + chunks_needed < result->num_chunks) {
-        if (load_chunk(result, start_chunk + chunks_needed) != 0) {
+    // Handle final carry propagation across multiple chunks if needed
+    size_t extra_chunk = start_chunk + chunks_needed;
+    while (carry > 0) {
+        // Check if we need to create a new chunk
+        if (extra_chunk >= result->num_chunks) {
+            result->num_chunks = extra_chunk + 1;
             memset(result->cache, 0, result->chunk_size * sizeof(mp_limb_t));
-            result->cache_chunk_idx = start_chunk + chunks_needed;
+            result->cache_chunk_idx = extra_chunk;
+        } else {
+            // Load existing chunk
+            if (load_chunk(result, extra_chunk) != 0) {
+                memset(result->cache, 0, result->chunk_size * sizeof(mp_limb_t));
+                result->cache_chunk_idx = extra_chunk;
+            }
         }
         
-        // Add carry to first limb of next chunk
-        ((mp_limb_t*)result->cache)[0] += carry;
+        // Add carry to the first limb of this chunk
+        mp_limb_t old_val = ((mp_limb_t*)result->cache)[0];
+        mp_limb_t new_val = old_val + carry;
         
         // Check if we have a new carry
-        carry = (((mp_limb_t*)result->cache)[0] == 0);
+        carry = (new_val < old_val) ? 1 : 0;
+        
+        // Store the updated value
+        ((mp_limb_t*)result->cache)[0] = new_val;
+        
+        // If we still have a carry, propagate it within this chunk
+        size_t k = 1;
+        while (carry > 0 && k < result->chunk_size) {
+            old_val = ((mp_limb_t*)result->cache)[k];
+            new_val = old_val + carry;
+            
+            // Update carry
+            carry = (new_val < old_val) ? 1 : 0;
+            
+            // Store the updated value
+            ((mp_limb_t*)result->cache)[k] = new_val;
+            k++;
+        }
         
         // Save this chunk
         result->dirty = true;
-        if (save_chunk(result, start_chunk + chunks_needed) != 0) {
-            fprintf(stderr, "Error: Failed to save chunk %zu in add_product_to_result\n", 
-                    start_chunk + chunks_needed);
+        if (save_chunk(result, extra_chunk) != 0) {
+            fprintf(stderr, "Error: Failed to save chunk %zu in add_product_to_result\n", extra_chunk);
             return;
         }
         
-        chunks_needed++;
+        // Move to next chunk if we still have carry
+        extra_chunk++;
     }
     
-    // If we still have carry, we need to add a new chunk
-    if (carry > 0) {
-        memset(result->cache, 0, result->chunk_size * sizeof(mp_limb_t));
-        ((mp_limb_t*)result->cache)[0] = carry;
-        result->cache_chunk_idx = start_chunk + chunks_needed;
-        result->dirty = true;
-        
-        if (save_chunk(result, start_chunk + chunks_needed) != 0) {
-            fprintf(stderr, "Error: Failed to save final carry chunk in add_product_to_result\n");
-            return;
+    // Update total size in limbs if needed
+    size_t potential_new_size = (result->num_chunks - 1) * result->chunk_size;
+    
+    // Load the last chunk to check its highest non-zero limb
+    if (load_chunk(result, result->num_chunks - 1) == 0) {
+        // Find the highest non-zero limb
+        int highest_limb = -1;
+        for (size_t i = result->chunk_size; i > 0; i--) {
+            if (((mp_limb_t*)result->cache)[i-1] != 0) {
+                highest_limb = (int)(i-1);
+                break;
+            }
         }
         
-        result->num_chunks = start_chunk + chunks_needed + 1;
-    }
-    
-    // Update total size if needed
-    size_t min_limbs = (start_chunk + chunks_needed) * result->chunk_size;
-    if (min_limbs > result->total_size_in_limbs) {
-        result->total_size_in_limbs = min_limbs;
+        if (highest_limb >= 0) {
+            potential_new_size += highest_limb + 1;
+            if (potential_new_size > result->total_size_in_limbs) {
+                result->total_size_in_limbs = potential_new_size;
+            }
+        }
     }
 }
 
@@ -1505,32 +1556,96 @@ void disk_int_mul(disk_int* result, disk_int* a, disk_int* b) {
             size_t product_size = chunk_a_size + chunk_b_size;
             
             // Perform long multiplication
+            // ARM64-optimized limb-by-limb multiplication that properly handles double-limb products
+            // Define inline ARM64 umul_ppmm function for multiplying two limbs into a double-limb result
+            #ifdef __aarch64__
+            #define umul_ppmm(high, low, a, b) \
+                __asm__ ("mul %0, %2, %3\n\t" \
+                         "umulh %1, %2, %3" \
+                         : "=&r" (low), "=r" (high) \
+                         : "r" (a), "r" (b) \
+                         : "cc")
+            #else
+            // Fallback implementation for non-ARM64 platforms
+            static inline void umul_ppmm(mp_limb_t* high_ptr, mp_limb_t* low_ptr, mp_limb_t a, mp_limb_t b) {
+                // Ensure mp_limb_t is 64-bit
+                const int limb_bits = sizeof(mp_limb_t) * 8;
+                const int half_bits = limb_bits / 2;
+                const mp_limb_t lower_mask = ((mp_limb_t)1 << half_bits) - 1;
+                
+                // Split operands into high/low parts (32-bit each for 64-bit mp_limb_t)
+                mp_limb_t a_high = a >> half_bits;
+                mp_limb_t a_low = a & lower_mask;
+                mp_limb_t b_high = b >> half_bits;
+                mp_limb_t b_low = b & lower_mask;
+                
+                // Compute partial products
+                mp_limb_t low = a_low * b_low;
+                mp_limb_t mid1 = a_low * b_high;
+                mp_limb_t mid2 = a_high * b_low;
+                mp_limb_t high = a_high * b_high;
+                
+                // Combine partial products with proper carry handling
+                mp_limb_t mid = mid1 + mid2;
+                if (mid < mid1) {
+                    high += ((mp_limb_t)1 << half_bits);
+                }
+                
+                high += (mid >> half_bits);
+                
+                mp_limb_t mid_low_shifted = (mid & lower_mask) << half_bits;
+                *low_ptr = low + mid_low_shifted;
+                if (*low_ptr < low) {
+                    high += 1;
+                }
+                
+                *high_ptr = high;
+            }
+            #endif
+            
             for (size_t k = 0; k < chunk_a_size; k++) {
                 mp_limb_t a_limb = ((mp_limb_t*)a->cache)[k];
                 mp_limb_t carry = 0;
                 
                 for (size_t m = 0; m < chunk_b_size; m++) {
                     mp_limb_t b_limb = ((mp_limb_t*)b->cache)[m];
-                    mp_limb_t prod_lo, prod_hi;
+                    mp_limb_t prod_hi, prod_lo;
                     
-                    // Multiply limbs and add to product with carry
-                    // This is a simplification - in reality, we'd need to handle 
-                    // multiplication of two limbs properly with umul_ppmm or similar
-                    mp_limb_t prod = a_limb * b_limb + product[k + m] + carry;
+                    // Multiply limbs to get full double-limb product using platform-specific optimization
+                    #ifdef __aarch64__
+                    umul_ppmm(prod_hi, prod_lo, a_limb, b_limb);
+                    #else
+                    umul_ppmm(&prod_hi, &prod_lo, a_limb, b_limb);
+                    #endif
                     
-                    // Simple overflow detection 
-                    if (prod < a_limb * b_limb || prod < product[k + m] || 
-                        (prod == product[k + m] && carry > 0)) {
-                        carry = 1;
-                    } else {
-                        carry = 0;
+                    // Add existing product value and previous carry to low part
+                    prod_lo += product[k + m];
+                    if (prod_lo < product[k + m]) {
+                        prod_hi += 1; // Carry from adding product[k + m]
                     }
                     
-                    product[k + m] = prod;
+                    prod_lo += carry;
+                    if (prod_lo < carry) {
+                        prod_hi += 1; // Carry from adding previous carry
+                    }
+                    
+                    // Store the result and propagate carry
+                    product[k + m] = prod_lo;
+                    carry = prod_hi;
                 }
                 
+                // If we have a carry after processing all limbs of b_chunk, add it to the next position
                 if (carry > 0) {
                     product[k + chunk_b_size] += carry;
+                    // Check if adding carry generates a new carry
+                    if (product[k + chunk_b_size] < carry) {
+                        size_t pos = k + chunk_b_size + 1;
+                        while (pos < 2 * result->chunk_size && product[pos-1] == 0) {
+                            product[pos]++;
+                            if (product[pos] != 0) break;
+                            pos++;
+                        }
+                    }
                 }
             }
             
