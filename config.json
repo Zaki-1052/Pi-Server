@@ -4,7 +4,7 @@
   "max_http_threads": 4,
   "max_calc_threads": 4,
   "max_digits": 5000000,
-  "memory_limit": 20,
+  "memory_limit": 6,
   "default_algorithm": "CH",
   "gl_iterations": 10,
   "gl_precision_bits": 128,

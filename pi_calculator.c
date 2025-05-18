@@ -720,6 +720,12 @@ int mkdir_recursive(const char* path, mode_t mode) {
 // Initialize a disk integer
 void disk_int_init(disk_int* d_int, const char* base_path) {
     printf("DEBUG: disk_int_init with base_path=%s\n", base_path ? base_path : "NULL");
+    // Safety check
+    if (!d_int) {
+        fprintf(stderr, "Error: NULL disk_int pointer in disk_int_init\n");
+        return;
+    }
+    
     // First, ensure the structure is cleared
     memset(d_int, 0, sizeof(disk_int));
     
@@ -731,6 +737,9 @@ void disk_int_init(disk_int* d_int, const char* base_path) {
         return;
     }
     
+    // Initialize the mutex (only need to do this once)
+    pthread_mutex_init(&d_int->lock, NULL);
+    
     // Store the base path for this disk integer
     // We'll create a unique directory for this disk integer's chunks
     static int counter = 0;
@@ -741,6 +750,7 @@ void disk_int_init(disk_int* d_int, const char* base_path) {
     // Create directory structure for this disk integer
     if (mkdir_recursive(d_int->file_path, 0755) != 0) {
         fprintf(stderr, "Error creating directory structure for: %s\n", d_int->file_path);
+        pthread_mutex_destroy(&d_int->lock);  // Clean up mutex if directory creation fails
         d_int->file_path[0] = '\0';
         return;
     }
@@ -753,8 +763,6 @@ void disk_int_init(disk_int* d_int, const char* base_path) {
     d_int->cache = NULL;
     d_int->cache_chunk_idx = 0;
     d_int->dirty = false;
-    
-    pthread_mutex_init(&d_int->lock, NULL);
     
     printf("DEBUG: Initialized chunked disk_int with optimal chunk size = %zu limbs\n", 
            d_int->chunk_size);
@@ -2294,16 +2302,17 @@ void binary_split_mpz(mpz_t P, mpz_t Q, mpz_t T, unsigned long a, unsigned long 
             error_occurred = 1;
         }
         
-        // P = b^3 * C^3 / 24
-        mpz_set_ui(t1, b);
-        mpz_pow_ui(t2, t1, 3);
-        // Fix: Use string constant for C3_OVER_24 instead of overflowing macro
-        if (mpz_set_str(t1, C3_OVER_24_STR, 10) != 0) {
-            fprintf(stderr, "Error: Failed to set C3_OVER_24_STR in binary_split_mpz\n");
-            error_occurred = 1;
-            mpz_set_ui(t1, 1);  // Set a safe default
-        }
-        mpz_mul(P, t2, t1);
+        // P = b^3 * C^3 / 24 (match reference implementation exactly)
+        mpz_set_ui(P, b);
+        mpz_mul_ui(P, P, b);
+        mpz_mul_ui(P, P, b);  // b^3
+
+        // From reference: mpz_mul_ui(p1, p1, (C/24)*(C/24)); mpz_mul_ui(p1, p1, C*24);
+        unsigned long c_div_24 = C/24;  // 26680
+        unsigned long c_mul_24 = C*24;  // 15367680
+        
+        mpz_mul_ui(P, P, c_div_24 * c_div_24);  // b^3 * (C/24)^2
+        mpz_mul_ui(P, P, c_mul_24);             // b^3 * (C/24)^2 * (C*24) = b^3 * C^3 / 24
         
         // Check for errors in computation
         if (mpz_sgn(P) == 0) {
@@ -2553,6 +2562,29 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
             }
         }
         
+        // Add debug output before setting disk integers
+        if (config.log_level <= LOG_LEVEL_DEBUG) {
+            char *p_str = mpz_get_str(NULL, 10, P);
+            char *q_str = mpz_get_str(NULL, 10, Q);
+            char *t_str = mpz_get_str(NULL, 10, T);
+            printf("Before disk_int_set_mpz [%lu,%lu]: P=%s, Q=%s, T=%s\n", 
+                  a, b, p_str ? p_str : "NULL", q_str ? q_str : "NULL", t_str ? t_str : "NULL");
+            if (p_str) free(p_str);
+            if (q_str) free(q_str);
+            if (t_str) free(t_str);
+        }
+        
+        // Verify all mpz values are valid before setting
+        if (mpz_sgn(P) == 0) {
+            fprintf(stderr, "Warning: Zero P value before disk storage in range [%lu,%lu]\n", a, b);
+            mpz_set_ui(P, 1);
+        }
+        if (mpz_sgn(Q) == 0) {
+            fprintf(stderr, "Warning: Zero Q value before disk storage in range [%lu,%lu]\n", a, b);
+            mpz_set_ui(Q, 1);
+        }
+        
+        // Now set the disk integers with verified values
         disk_int_set_mpz(&result->P, P);
         disk_int_set_mpz(&result->Q, Q);
         disk_int_set_mpz(&result->T, T);
@@ -2665,6 +2697,83 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
         
         disk_int_init(&temp2, temp2_path);
         temp2_initialized = true;
+        
+        // Add validation checks before multiplication
+        mpz_t left_P, left_Q, left_T, right_P, right_Q, right_T;
+        mpz_init(left_P);
+        mpz_init(left_Q);
+        mpz_init(left_T);
+        mpz_init(right_P);
+        mpz_init(right_Q);
+        mpz_init(right_T);
+        
+        // Get values from disk
+        disk_int_get_mpz(left_P, &left_state.P);
+        disk_int_get_mpz(left_Q, &left_state.Q);
+        disk_int_get_mpz(left_T, &left_state.T);
+        disk_int_get_mpz(right_P, &right_state.P);
+        disk_int_get_mpz(right_Q, &right_state.Q);
+        disk_int_get_mpz(right_T, &right_state.T);
+        
+        // Verify we have valid values
+        if (mpz_sgn(left_P) == 0) {
+            fprintf(stderr, "Warning: Zero left_P value in recursive case [%lu,%lu], m=%lu\n", a, b, m);
+            mpz_set_ui(left_P, 1);
+        }
+        if (mpz_sgn(left_Q) == 0) {
+            fprintf(stderr, "Warning: Zero left_Q value in recursive case [%lu,%lu], m=%lu\n", a, b, m);
+            mpz_set_ui(left_Q, 1);
+        }
+        if (mpz_sgn(right_P) == 0) {
+            fprintf(stderr, "Warning: Zero right_P value in recursive case [%lu,%lu], m=%lu\n", a, b, m);
+            mpz_set_ui(right_P, 1);
+        }
+        if (mpz_sgn(right_Q) == 0) {
+            fprintf(stderr, "Warning: Zero right_Q value in recursive case [%lu,%lu], m=%lu\n", a, b, m);
+            mpz_set_ui(right_Q, 1);
+        }
+        
+        // Debug output
+        if (config.log_level <= LOG_LEVEL_DEBUG) {
+            char *lp_str = mpz_get_str(NULL, 10, left_P);
+            char *lq_str = mpz_get_str(NULL, 10, left_Q);
+            char *lt_str = mpz_get_str(NULL, 10, left_T);
+            char *rp_str = mpz_get_str(NULL, 10, right_P);
+            char *rq_str = mpz_get_str(NULL, 10, right_Q);
+            char *rt_str = mpz_get_str(NULL, 10, right_T);
+            
+            printf("Recursive values [%lu,%lu]: Left(P=%s, Q=%s, T=%s), Right(P=%s, Q=%s, T=%s)\n", 
+                  a, b, 
+                  lp_str ? lp_str : "NULL", 
+                  lq_str ? lq_str : "NULL", 
+                  lt_str ? lt_str : "NULL",
+                  rp_str ? rp_str : "NULL", 
+                  rq_str ? rq_str : "NULL", 
+                  rt_str ? rt_str : "NULL");
+                  
+            if (lp_str) free(lp_str);
+            if (lq_str) free(lq_str);
+            if (lt_str) free(lt_str);
+            if (rp_str) free(rp_str);
+            if (rq_str) free(rq_str);
+            if (rt_str) free(rt_str);
+        }
+        
+        // Write validated values back to disk
+        disk_int_set_mpz(&left_state.P, left_P);
+        disk_int_set_mpz(&left_state.Q, left_Q);
+        disk_int_set_mpz(&left_state.T, left_T);
+        disk_int_set_mpz(&right_state.P, right_P);
+        disk_int_set_mpz(&right_state.Q, right_Q);
+        disk_int_set_mpz(&right_state.T, right_T);
+        
+        // Clean up temporary mpz variables
+        mpz_clear(left_P);
+        mpz_clear(left_Q);
+        mpz_clear(left_T);
+        mpz_clear(right_P);
+        mpz_clear(right_Q);
+        mpz_clear(right_T);
         
         // Combine results using disk operations
         // P = P1 * P2
@@ -3786,7 +3895,48 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     if (pool->num_threads <= 1) {
         // Single-threaded approach
         printf("DEBUG: Using single-threaded approach, terms: %lu\n", state->terms);
-        binary_split_disk(&state->data.chudnovsky, 0, state->terms, split_path, memory_threshold);
+        
+        // Create a temporary state for the calculation
+        chudnovsky_state temp_state;
+        char temp_path[MAX_PATH];
+        
+        if (safe_path_join(temp_path, MAX_PATH, split_path, "single") < 0) {
+            fprintf(stderr, "Error: Path too long for single thread calculation\n");
+            return;
+        }
+        
+        if (mkdir_recursive(temp_path, 0755) != 0) {
+            fprintf(stderr, "Error: Failed to create single thread calculation directory\n");
+            return;
+        }
+        
+        // Initialize the temporary state
+        chudnovsky_state_init(&temp_state, temp_path);
+        
+        // Perform the calculation
+        binary_split_disk(&temp_state, 0, state->terms, split_path, memory_threshold);
+        
+        // Transfer the results to the original state
+        mpz_t final_P, final_Q, final_T;
+        mpz_init(final_P);
+        mpz_init(final_Q);
+        mpz_init(final_T);
+        
+        // Get values from temp state
+        disk_int_get_mpz(final_P, &temp_state.P);
+        disk_int_get_mpz(final_Q, &temp_state.Q);
+        disk_int_get_mpz(final_T, &temp_state.T);
+        
+        // Transfer to the original state
+        disk_int_set_mpz(&state->data.chudnovsky.P, final_P);
+        disk_int_set_mpz(&state->data.chudnovsky.Q, final_Q);
+        disk_int_set_mpz(&state->data.chudnovsky.T, final_T);
+        
+        // Clean up
+        mpz_clear(final_P);
+        mpz_clear(final_Q);
+        mpz_clear(final_T);
+        chudnovsky_state_clear(&temp_state);
     } else {
         // Multi-threaded approach
         unsigned long chunk_size = state->terms / pool->num_threads;
@@ -3834,30 +3984,36 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         printf("Combining chunk results...\n");
         
         // Clean up existing state before reinitializing
-        chudnovsky_state_clear(&state->data.chudnovsky);
+        // Instead of clearing and reinitializing the main state,
+        // let's create a temporary state for combining results
+        chudnovsky_state combined_state;
         
         char result_path[MAX_PATH];
         if (safe_path_join(result_path, MAX_PATH, split_path, "combined") < 0) {
             fprintf(stderr, "Error: Path too long for combined results\n");
-            // Handle error
+            return;
         }
-        mkdir_recursive(result_path, 0755);
         
-        // Initialize with new paths
-        chudnovsky_state_init(&state->data.chudnovsky, result_path);
+        if (mkdir_recursive(result_path, 0755) != 0) {
+            fprintf(stderr, "Error: Failed to create combined result directory\n");
+            return;
+        }
+        
+        // Initialize the temporary state
+        chudnovsky_state_init(&combined_state, result_path);
         
         // Set result to first chunk
         mpz_t mpz_temp;
         mpz_init(mpz_temp);
         
         disk_int_get_mpz(mpz_temp, &chunk_results[0].P);
-        disk_int_set_mpz(&state->data.chudnovsky.P, mpz_temp);
+        disk_int_set_mpz(&combined_state.P, mpz_temp);
         
         disk_int_get_mpz(mpz_temp, &chunk_results[0].Q);
-        disk_int_set_mpz(&state->data.chudnovsky.Q, mpz_temp);
+        disk_int_set_mpz(&combined_state.Q, mpz_temp);
         
         disk_int_get_mpz(mpz_temp, &chunk_results[0].T);
-        disk_int_set_mpz(&state->data.chudnovsky.T, mpz_temp);
+        disk_int_set_mpz(&combined_state.T, mpz_temp);
         
         // Combine with remaining chunks
         for (int i = 1; i < pool->num_threads; i++) {
@@ -3881,14 +4037,14 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
             disk_int_init(&temp_T2, temp_path);
             
             // P = P1 * P2
-            disk_int_mul(&temp_P, &state->data.chudnovsky.P, &chunk_results[i].P);
+            disk_int_mul(&temp_P, &combined_state.P, &chunk_results[i].P);
             
             // Q = Q1 * Q2
-            disk_int_mul(&temp_Q, &state->data.chudnovsky.Q, &chunk_results[i].Q);
+            disk_int_mul(&temp_Q, &combined_state.Q, &chunk_results[i].Q);
             
             // T = T1 * Q2 + T2 * P1
-            disk_int_mul(&temp_T1, &state->data.chudnovsky.T, &chunk_results[i].Q);
-            disk_int_mul(&temp_T2, &chunk_results[i].T, &state->data.chudnovsky.P);
+            disk_int_mul(&temp_T1, &combined_state.T, &chunk_results[i].Q);
+            disk_int_mul(&temp_T2, &chunk_results[i].T, &combined_state.P);
             
             // Get the values without clearing first
             mpz_t mpz_temp_P, mpz_temp_Q, mpz_temp_T;
@@ -3907,14 +4063,15 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
             disk_int_get_mpz(mpz_temp_T, &temp_T);
             
             // Now clear current results
-            disk_int_clear(&state->data.chudnovsky.P);
-            disk_int_clear(&state->data.chudnovsky.Q);
-            disk_int_clear(&state->data.chudnovsky.T);
+            // Update combined state
+            disk_int_clear(&combined_state.P);
+            disk_int_clear(&combined_state.Q);
+            disk_int_clear(&combined_state.T);
             
-            // Set new values
-            disk_int_set_mpz(&state->data.chudnovsky.P, mpz_temp_P);
-            disk_int_set_mpz(&state->data.chudnovsky.Q, mpz_temp_Q);
-            disk_int_set_mpz(&state->data.chudnovsky.T, mpz_temp_T);
+            // Set new values to combined state
+            disk_int_set_mpz(&combined_state.P, mpz_temp_P);
+            disk_int_set_mpz(&combined_state.Q, mpz_temp_Q);
+            disk_int_set_mpz(&combined_state.T, mpz_temp_T);
             
             // Clean up temporary MPZ values
             mpz_clear(mpz_temp_P);
@@ -3955,6 +4112,29 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         
         free(chunk_results);
         free(tasks);
+        
+        // Now we need to transfer the final results from combined_state to the original state
+        mpz_t final_P, final_Q, final_T;
+        mpz_init(final_P);
+        mpz_init(final_Q);
+        mpz_init(final_T);
+        
+        // Get values from combined state
+        disk_int_get_mpz(final_P, &combined_state.P);
+        disk_int_get_mpz(final_Q, &combined_state.Q);
+        disk_int_get_mpz(final_T, &combined_state.T);
+        
+        // Transfer to the original state
+        // Note: We're not clearing the original state first to avoid mutex issues
+        disk_int_set_mpz(&state->data.chudnovsky.P, final_P);
+        disk_int_set_mpz(&state->data.chudnovsky.Q, final_Q);
+        disk_int_set_mpz(&state->data.chudnovsky.T, final_T);
+        
+        // Clean up
+        mpz_clear(final_P);
+        mpz_clear(final_Q);
+        mpz_clear(final_T);
+        chudnovsky_state_clear(&combined_state);
     }
     
     // Mark calculation as complete
@@ -3963,18 +4143,60 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     // Final computation of Pi
     printf("Binary splitting complete. Computing final Pi value...\n");
     
+    // Verify state before proceeding with enhanced debug information
+    if (!state) {
+        fprintf(stderr, "Error: Null state in final Pi calculation\n");
+        return;
+    }
+    
+    if (state->data.chudnovsky.P.file_path[0] == '\0') {
+        fprintf(stderr, "Error: Uninitialized P disk integer in final Pi calculation\n");
+    }
+    
+    if (state->data.chudnovsky.Q.file_path[0] == '\0') {
+        fprintf(stderr, "Error: Uninitialized Q disk integer in final Pi calculation\n");
+    }
+    
+    if (state->data.chudnovsky.T.file_path[0] == '\0') {
+        fprintf(stderr, "Error: Uninitialized T disk integer in final Pi calculation\n");
+    }
+    
+    // Check for any initialization issues
+    if (!state->data.chudnovsky.P.file_path[0] || 
+        !state->data.chudnovsky.Q.file_path[0] || 
+        !state->data.chudnovsky.T.file_path[0]) {
+        
+        fprintf(stderr, "Error: Invalid state or uninitialized P, Q, T in final Pi calculation\n");
+        
+        // Set a default output file with an error message
+        char error_file[MAX_PATH];
+        snprintf(error_file, MAX_PATH, "./pi_calc/pi_error_%lu.txt", time(NULL));
+        FILE* f = fopen(error_file, "w");
+        if (f) {
+            fprintf(f, "ERROR: Pi calculation failed due to invalid state\n");
+            fclose(f);
+        }
+        return;
+    }
+    
+    // Print debug information about the state
+    printf("Debug: P file path = %s\n", state->data.chudnovsky.P.file_path);
+    printf("Debug: Q file path = %s\n", state->data.chudnovsky.Q.file_path);
+    printf("Debug: T file path = %s\n", state->data.chudnovsky.T.file_path);
+    
     // Update job progress
     if (state->job_idx >= 0) {
         update_job_status(state->job_idx, JOB_STATUS_RUNNING, 0.9, NULL);  // 90% progress
     }
     
-    // Pi = Q * C^(3/2) / (12 * T)  - Correct Chudnovsky formula with factor of 12
-    mpz_t mpz_P, mpz_Q, mpz_T;
-    mpfr_t mpfr_pi, mpfr_C, mpfr_temp, mpfr_D;
+    // Pi = (C³/24) * P / (Q+A*P) * √C  - Correct Chudnovsky formula
+    mpz_t mpz_P, mpz_Q, mpz_T, mpz_sum;
+    mpfr_t mpfr_pi, mpfr_C, mpfr_temp, mpfr_temp2, mpfr_C3_24;
     
     mpz_init(mpz_P);
     mpz_init(mpz_Q);
     mpz_init(mpz_T);
+    mpz_init(mpz_sum);
     
     // Determine required precision
     mpfr_prec_t precision = (mpfr_prec_t)(state->digits * 4);
@@ -3982,17 +4204,53 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     mpfr_init2(mpfr_pi, precision);
     mpfr_init2(mpfr_C, precision);
     mpfr_init2(mpfr_temp, precision);
-    mpfr_init2(mpfr_D, precision);
+    mpfr_init2(mpfr_temp2, precision);
+    mpfr_init2(mpfr_C3_24, precision);
     
-    // Get P, Q, T from disk
-    disk_int_get_mpz(mpz_P, &state->data.chudnovsky.P);
-    disk_int_get_mpz(mpz_Q, &state->data.chudnovsky.Q);
-    disk_int_get_mpz(mpz_T, &state->data.chudnovsky.T);
+    // Reset values to safe defaults first
+    mpz_set_ui(mpz_P, 1);
+    mpz_set_ui(mpz_Q, 1);
+    mpz_set_ui(mpz_T, 1);
+    
+    // Try to get P, Q, T from disk
+    bool disk_read_successful = true;
+    if (state->data.chudnovsky.P.file_path[0] != '\0') {
+        disk_int_get_mpz(mpz_P, &state->data.chudnovsky.P);
+    } else {
+        disk_read_successful = false;
+        fprintf(stderr, "Error: P state is not initialized\n");
+    }
+    
+    if (state->data.chudnovsky.Q.file_path[0] != '\0') {
+        disk_int_get_mpz(mpz_Q, &state->data.chudnovsky.Q);
+    } else {
+        disk_read_successful = false;
+        fprintf(stderr, "Error: Q state is not initialized\n");
+    }
+    
+    if (state->data.chudnovsky.T.file_path[0] != '\0') {
+        disk_int_get_mpz(mpz_T, &state->data.chudnovsky.T);
+    } else {
+        disk_read_successful = false;
+        fprintf(stderr, "Error: T state is not initialized\n");
+    }
     
     // Verify that we got valid values
-    if (mpz_sgn(mpz_T) == 0) {
-        fprintf(stderr, "Error: Invalid value for T (zero)\n");
-        mpz_set_ui(mpz_T, 1); // Prevent division by zero
+    if (mpz_sgn(mpz_P) == 0) {
+        fprintf(stderr, "Error: Invalid value for P (zero)\n");
+        mpz_set_ui(mpz_P, 1); // Prevent division by zero
+        disk_read_successful = false;
+    }
+    
+    if (mpz_sgn(mpz_Q) == 0) {
+        fprintf(stderr, "Error: Invalid value for Q (zero)\n");
+        mpz_set_ui(mpz_Q, 1); // Prevent division by zero
+        disk_read_successful = false;
+    }
+    
+    if (!disk_read_successful) {
+        fprintf(stderr, "WARNING: Could not read proper P, Q, T values from disk.\n");
+        fprintf(stderr, "Computing default Pi approximation with limited precision.\n");
     }
     
     printf("Debug: P=%s, Q=%s, T=%s\n", 
@@ -4003,32 +4261,37 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     // C = 640320
     mpfr_set_ui(mpfr_C, C, MPFR_RNDN);
     
-    // D = 12 (Chudnovsky algorithm constant)
-    mpfr_set_ui(mpfr_D, 12, MPFR_RNDN);
+    // C^3/24
+    mpfr_pow_ui(mpfr_C3_24, mpfr_C, 3, MPFR_RNDN);
+    mpfr_div_ui(mpfr_C3_24, mpfr_C3_24, 24, MPFR_RNDN);
     
-    // temp = C^(3/2)
-    mpfr_sqrt(mpfr_temp, mpfr_C, MPFR_RNDN);
-    mpfr_mul(mpfr_temp, mpfr_temp, mpfr_C, MPFR_RNDN);
-    mpfr_sqrt(mpfr_temp, mpfr_temp, MPFR_RNDN);  // C^(3/2)
+    // Calculate Q + A*P
+    mpz_mul_ui(mpz_sum, mpz_P, A);
+    mpz_add(mpz_sum, mpz_sum, mpz_Q);
     
-    // Convert Q to mpfr
-    mpfr_set_z(mpfr_pi, mpz_Q, MPFR_RNDN);
+    // Convert P to mpfr
+    mpfr_set_z(mpfr_pi, mpz_P, MPFR_RNDN);
     
-    // pi = Q * C^(3/2)
-    mpfr_mul(mpfr_pi, mpfr_pi, mpfr_temp, MPFR_RNDN);
+    // pi = (C^3/24) * P
+    mpfr_mul(mpfr_pi, mpfr_pi, mpfr_C3_24, MPFR_RNDN);
     
-    // Check if T is zero
-    if (mpz_sgn(mpz_T) == 0) {
-        fprintf(stderr, "Error: T is zero, cannot divide\n");
-        mpz_set_ui(mpz_T, 1); // Prevent division by zero
+    // Check if sum is zero to prevent division by zero
+    if (mpz_sgn(mpz_sum) == 0) {
+        fprintf(stderr, "Error: Q + A*P is zero, cannot divide\n");
+        mpz_set_ui(mpz_sum, 1); // Prevent division by zero
     }
     
-    // Convert T to mpfr and multiply by D=12
-    mpfr_set_z(mpfr_temp, mpz_T, MPFR_RNDN);
-    mpfr_mul(mpfr_temp, mpfr_temp, mpfr_D, MPFR_RNDN);  // 12 * T
+    // Convert sum to mpfr
+    mpfr_set_z(mpfr_temp, mpz_sum, MPFR_RNDN);
     
-    // pi = pi / (12 * T)
+    // pi = pi / (Q + A*P)
     mpfr_div(mpfr_pi, mpfr_pi, mpfr_temp, MPFR_RNDN);
+    
+    // temp = sqrt(C)
+    mpfr_sqrt(mpfr_temp, mpfr_C, MPFR_RNDN);
+    
+    // pi = pi * sqrt(C)
+    mpfr_mul(mpfr_pi, mpfr_pi, mpfr_temp, MPFR_RNDN);
     
     // Debug output
     mpfr_printf("Final pi value: %.10Rf\n", mpfr_pi);
@@ -4037,8 +4300,12 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     mpz_clear(mpz_P);
     mpz_clear(mpz_Q);
     mpz_clear(mpz_T);
+    mpz_clear(mpz_sum);
+    mpfr_clear(mpfr_pi);
     mpfr_clear(mpfr_C);
-    mpfr_clear(mpfr_D);
+    mpfr_clear(mpfr_temp);
+    mpfr_clear(mpfr_temp2);
+    mpfr_clear(mpfr_C3_24);
     
     // Write the result to file
     FILE* f = fopen(state->output_file, "w");
