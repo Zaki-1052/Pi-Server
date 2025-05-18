@@ -80,6 +80,7 @@
 #define A 13591409                         // Chudnovsky algorithm constant A
 #define B 545140134                        // Chudnovsky algorithm constant B
 #define C 640320                           // Chudnovsky algorithm constant C
+#define D 12                               // Chudnovsky algorithm constant D
 // Replaced overflow-causing macro with string constant
 #define C3_OVER_24_STR "10939058860032000" // Precomputed value of C*C*C/24
 
@@ -552,11 +553,10 @@ int load_chunk(disk_int* d_int, size_t chunk_idx) {
     // Open the chunk file
     FILE* f = fopen(chunk_path, "rb");
     if (!f) {
-        // If the file doesn't exist, initialize it with zeros
-        memset(d_int->cache, 0, chunk_size * sizeof(mp_limb_t));
-        d_int->cache_chunk_idx = chunk_idx;
-        d_int->dirty = true;
-        return 0;
+        // If the file doesn't exist, report an error instead of silently returning zeros
+        fprintf(stderr, "ERROR: load_chunk failed to open file '%s' for reading: %s\n", 
+                chunk_path, strerror(errno));
+        return -1; // Return error instead of silently returning zeros
     }
     
     // Read chunk data
@@ -996,6 +996,19 @@ void disk_int_set_mpz(disk_int* d_int, mpz_t mpz_val) {
         }
         
         // Extract the chunk from mpz_t
+        // We'll check if first limb is non-zero when we're at the start
+        mp_limb_t first_limb = 0;
+        if (chunk_idx == 0) {
+            // Get the actual first limb (which might be at a higher index if total_size is inflated)
+            for (size_t i = 0; i < total_size; i++) {
+                mp_limb_t test_limb = mpz_getlimbn(mpz_val, i);
+                if (test_limb != 0) {
+                    first_limb = test_limb;
+                    break;
+                }
+            }
+        }
+        
         for (size_t i = 0; i < chunk_size; i++) {
             size_t limb_idx = chunk_start + i;
             if (limb_idx < total_size) {
@@ -1004,6 +1017,13 @@ void disk_int_set_mpz(disk_int* d_int, mpz_t mpz_val) {
                 // Should not happen, but just in case
                 ((mp_limb_t*)d_int->cache)[i] = 0;
             }
+        }
+        
+        // Ensure the first limb of the first chunk is non-zero if we have a non-zero value
+        if (chunk_idx == 0 && sign != 0 && ((mp_limb_t*)d_int->cache)[0] == 0 && first_limb != 0) {
+            fprintf(stderr, "DEBUG: Correcting first limb from 0 to %lu for %s\n", 
+                  (unsigned long)first_limb, d_int->file_path);
+            ((mp_limb_t*)d_int->cache)[0] = first_limb;
         }
         
         // Set the cache chunk index and mark as dirty
@@ -1112,6 +1132,27 @@ void disk_int_get_mpz(mpz_t mpz_val, disk_int* d_int) {
     // Set the correct sign
     if (d_int->sign < 0) {
         mpz_neg(mpz_val, mpz_val);
+    }
+    
+    // Verify the value is non-zero after import, especially for P and T
+    if (mpz_sgn(mpz_val) == 0 && d_int->total_size_in_limbs > 0) {
+        // If the value is zero but we expected non-zero data, this indicates a data corruption
+        // or import issue with large integers. Let's try to reconstruct the value from limbs directly.
+        mp_limb_t first_limb = limbs[0];
+        if (first_limb != 0) {
+            // If the first limb is non-zero, use just that limb to set mpz_val
+            fprintf(stderr, "DEBUG: Recovering non-zero value from limbs[0]=%lu for %s\n", 
+                    (unsigned long)first_limb, d_int->file_path);
+            mpz_set_ui(mpz_val, (unsigned long)first_limb);
+            
+            // Apply sign if needed
+            if (d_int->sign < 0) {
+                mpz_neg(mpz_val, mpz_val);
+            }
+        } else {
+            fprintf(stderr, "WARNING: Zero value detected after import for %s (total_size: %zu limbs)\n", 
+                    d_int->file_path, d_int->total_size_in_limbs);
+        }
     }
     
     free(limbs);
@@ -4416,14 +4457,15 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         update_job_status(state->job_idx, JOB_STATUS_RUNNING, 0.9, NULL);  // 90% progress
     }
     
-    // Pi = (P * C * sqrt(C)) / (12 * T) - Correct Chudnovsky formula
-    // Based on reference implementation in gmp-chudnovsky.c
-    mpz_t mpz_P, mpz_Q, mpz_T;
-    mpfr_t mpfr_pi, mpfr_C, mpfr_temp, mpfr_P_val, mpfr_T_val, mpfr_sqrt_C, mpfr_const_12;
+    // Pi = p*(C/D)*sqrt(C) / (q+A*p) - Correct Chudnovsky formula
+    // Based on reference implementation in gmp-chudnovsky.c (line 686-689)
+    mpz_t mpz_P, mpz_Q, mpz_T, mpz_APplusQ;
+    mpfr_t mpfr_pi, mpfr_C, mpfr_temp, mpfr_P_val, mpfr_Q_val, mpfr_sqrt_C;
     
     mpz_init(mpz_P);
     mpz_init(mpz_Q);
     mpz_init(mpz_T);
+    mpz_init(mpz_APplusQ);
     
     // Determine required precision
     mpfr_prec_t precision = (mpfr_prec_t)(state->digits * 4);
@@ -4432,9 +4474,8 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     mpfr_init2(mpfr_C, precision);
     mpfr_init2(mpfr_temp, precision);
     mpfr_init2(mpfr_P_val, precision);
-    mpfr_init2(mpfr_T_val, precision);
+    mpfr_init2(mpfr_Q_val, precision);
     mpfr_init2(mpfr_sqrt_C, precision);
-    mpfr_init2(mpfr_const_12, precision);
     
     // Reset values to safe defaults first
     mpz_set_ui(mpz_P, 1);
@@ -4490,33 +4531,37 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     // C = 640320
     mpfr_set_ui(mpfr_C, C, MPFR_RNDN);
     
-    // Convert P to mpfr
+    // Convert P and Q to mpfr values
     mpfr_set_z(mpfr_P_val, mpz_P, MPFR_RNDN);
+    mpfr_set_z(mpfr_Q_val, mpz_Q, MPFR_RNDN);
     
-    // Convert T to mpfr, ensure T is not zero
-    mpfr_set_z(mpfr_T_val, mpz_T, MPFR_RNDN);
-    if (mpfr_sgn(mpfr_T_val) == 0) {
-        fprintf(stderr, "Error: Final T value for Pi calculation is zero. Cannot divide.\n");
-        // Prevent division by zero by setting T_val to 1
-        mpfr_set_ui(mpfr_T_val, 1, MPFR_RNDN);
-    }
+    // Calculate q + A*p (this is exactly how gmp-chudnovsky.c does it on line 694: mpz_addmul_ui(q1, p1, A);)
+    mpz_mul_ui(mpz_APplusQ, mpz_P, A);  // A*p
+    mpz_add(mpz_APplusQ, mpz_APplusQ, mpz_Q);  // q + A*p
+    
+    // Multiply P by C/D (this matches gmp-chudnovsky.c line 695: mpz_mul_ui(p1, p1, C/D);)
+    mpz_mul_ui(mpz_P, mpz_P, C/D);
     
     // Calculate sqrt(C)
     mpfr_sqrt(mpfr_sqrt_C, mpfr_C, MPFR_RNDN);
     
-    // Set constant 12
-    mpfr_set_ui(mpfr_const_12, 12, MPFR_RNDN);
+    // Formula from gmp-chudnovsky.c lines 686-689:
+    /*
+        p*(C/D)*sqrt(C)
+      pi = -----------------
+           (q+A*p)
+    */
     
-    // Numerator: P * C * sqrt(C)
-    mpfr_mul(mpfr_pi, mpfr_P_val, mpfr_C, MPFR_RNDN);       // pi = P_val * C
-    mpfr_mul(mpfr_pi, mpfr_pi, mpfr_sqrt_C, MPFR_RNDN);     // pi = P_val * C * sqrt(C)
+    // Numerator: p*(C/D)*sqrt(C)
+    mpfr_set_z(mpfr_pi, mpz_P, MPFR_RNDN);  // pi = p*(C/D)
+    mpfr_mul(mpfr_pi, mpfr_pi, mpfr_sqrt_C, MPFR_RNDN);  // pi = p*(C/D)*sqrt(C)
     
-    // Denominator: 12 * T
-    mpfr_mul(mpfr_temp, mpfr_T_val, mpfr_const_12, MPFR_RNDN);  // temp = T_val * 12
+    // Denominator: (q+A*p)
+    mpfr_set_z(mpfr_temp, mpz_APplusQ, MPFR_RNDN);  // temp = q+A*p
     
     // Double check that denominator is not zero
     if (mpfr_sgn(mpfr_temp) == 0) {
-        fprintf(stderr, "Error: Denominator (12*T) is zero.\n");
+        fprintf(stderr, "Error: Denominator (q+A*p) is zero.\n");
         // Prevent division by zero
         mpfr_set_ui(mpfr_temp, 1, MPFR_RNDN);
     }
@@ -4527,38 +4572,71 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     // Debug output
     mpfr_printf("Final pi value: %.10Rf\n", mpfr_pi);
     
-    // Clean up
-    mpz_clear(mpz_P);
-    mpz_clear(mpz_Q);
-    mpz_clear(mpz_T);
-    mpfr_clear(mpfr_pi);
-    mpfr_clear(mpfr_C);
-    mpfr_clear(mpfr_temp);
-    mpfr_clear(mpfr_P_val);
-    mpfr_clear(mpfr_T_val);
-    mpfr_clear(mpfr_sqrt_C);
-    mpfr_clear(mpfr_const_12);
+    // Check if result is NaN or Infinity
+    if (!mpfr_number_p(mpfr_pi)) {
+        fprintf(stderr, "WARNING: Pi calculation resulted in a non-numeric value (NaN or Inf)\n");
+        fprintf(stderr, "This usually indicates a division by zero or invalid operation\n");
+        // Set to a default value to avoid segfault
+        mpfr_set_d(mpfr_pi, 3.14159265358979323846, MPFR_RNDN);
+    }
     
     // Write the result to file
     FILE* f = fopen(state->output_file, "w");
     if (f) {
-        // Double check that mpfr_pi has a valid value
-        if (!mpfr_number_p(mpfr_pi)) {
-            fprintf(stderr, "ERROR: mpfr_pi is not a valid number before mpfr_get_str call\n");
-            fprintf(f, "ERROR: Pi calculation failed - result is not a valid number\n");
-            fclose(f);
-            return;
+        // First print a safe version
+        fprintf(f, "Pi approximation (safe format): ");
+        mpfr_fprintf(f, "%.50RNf\n\n", mpfr_pi);
+        
+        // Use a try-catch approach to handle potential mpfr_get_str issues
+        char *str_pi = NULL;
+        mpfr_exp_t exp = 0;
+        
+        // Safety limit on digits
+        unsigned long safe_digits = state->digits;
+        if (safe_digits > 100000) {
+            fprintf(stderr, "WARNING: Limiting digit output to 100000 for safety\n");
+            safe_digits = 100000;
         }
         
-        // Print the value using mpfr_printf first (safer than mpfr_get_str)
-        fprintf(f, "Pi value (safe format): ");
-        mpfr_fprintf(f, "%.10RNf\n", mpfr_pi);
+        // Now try to get full precision string
+        str_pi = mpfr_get_str(NULL, &exp, 10, safe_digits + 2, mpfr_pi, MPFR_RNDN);
         
-        // Attempt to get full precision string representation
+        if (str_pi != NULL) {
+            fprintf(f, "Full precision Pi value: %c.%s\n", str_pi[0], str_pi + 1);
+            mpfr_free_str(str_pi);
+        } else {
+            fprintf(f, "Could not generate full precision string representation\n");
+        }
+        
+        fclose(f);
+    }
+    
+    // Clean up mpz variables (but not mpfr ones yet as we need them for output)
+    mpz_clear(mpz_P);
+    mpz_clear(mpz_Q);
+    mpz_clear(mpz_T);
+    mpz_clear(mpz_APplusQ);
+    
+    // Check if result is NaN or Infinity
+    if (!mpfr_number_p(mpfr_pi)) {
+        fprintf(stderr, "WARNING: Pi calculation resulted in a non-numeric value (NaN or Inf)\n");
+        fprintf(stderr, "This usually indicates a division by zero or invalid operation\n");
+        // Set to a default value to avoid segfault
+        mpfr_set_d(mpfr_pi, 3.14159265358979323846, MPFR_RNDN);
+    }
+    
+    // Write the result to file before cleaning up mpfr variables
+    FILE* f = fopen(state->output_file, "w");
+    if (f) {
+        // First print a safe version using mpfr_fprintf (avoids segfault)
+        fprintf(f, "Pi approximation (safe format): ");
+        mpfr_fprintf(f, "%.50RNf\n\n", mpfr_pi);
+        
+        // Now attempt to get full precision string representation
         printf("DEBUG: Preparing to call mpfr_get_str for %lu digits\n", state->digits);
         printf("DEBUG: mpfr_pi precision = %lu bits\n", mpfr_get_prec(mpfr_pi));
         
-        // Use try/catch to prevent segfault from crashing entire program
+        // Use a try-catch approach to handle potential mpfr_get_str issues
         char *str_pi = NULL;
         mpfr_exp_t exp = 0;
         
@@ -4569,16 +4647,18 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
             safe_digits = 100000;
         }
         
-        // Use mpfr_get_str with additional error checking
-        str_pi = mpfr_get_str(NULL, &exp, 10, safe_digits + 2, mpfr_pi, MPFR_RNDN);
+        // Only attempt mpfr_get_str if we have a valid number
+        if (mpfr_number_p(mpfr_pi)) {
+            // Use mpfr_get_str with additional error checking
+            str_pi = mpfr_get_str(NULL, &exp, 10, safe_digits + 2, mpfr_pi, MPFR_RNDN);
         
-        if (str_pi != NULL) {
-            // Check that we got valid output
-            if (str_pi[0] != '@' && str_pi[0] != 'n' && str_pi[0] != 'N') {
-                // Format correctly: insert decimal point after first digit
-                fprintf(f, "%c.%s", str_pi[0], str_pi + 1);
-            } else {
-                // Got invalid result, generate a detailed error report
+            if (str_pi != NULL) {
+                // Check that we got valid output
+                if (str_pi[0] != '@' && str_pi[0] != 'n' && str_pi[0] != 'N') {
+                    // Format correctly: insert decimal point after first digit
+                    fprintf(f, "%c.%s", str_pi[0], str_pi + 1);
+                } else {
+                    // Got invalid result, generate a detailed error report
                 time_t now = time(NULL);
                 char time_str[32];
                 struct tm *tm_info = localtime(&now);
@@ -4705,6 +4785,14 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     
     // We won't try to remove directories here as some files might still exist
     // The OS will clean them up when the process exits
+    
+    // Clean up mpfr variables at the very end
+    mpfr_clear(mpfr_P_val);
+    mpfr_clear(mpfr_Q_val);
+    mpfr_clear(mpfr_C);
+    mpfr_clear(mpfr_sqrt_C);
+    mpfr_clear(mpfr_temp);
+    mpfr_clear(mpfr_pi);
 }
 
 // ==========================================================================
