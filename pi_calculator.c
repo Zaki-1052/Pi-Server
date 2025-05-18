@@ -24,6 +24,7 @@
 #include <limits.h>
 #include <errno.h>
 #include <getopt.h>
+#include <stdarg.h>
 
 // Networking libraries
 #include <arpa/inet.h>
@@ -45,8 +46,147 @@
 // Signal handling
 #include <signal.h>
 
+// ==========================================================================
+// Constants and Macros
+// ==========================================================================
+
+// Buffer sizes and limits
+#define BUFFER_SIZE 4096                   // General purpose buffer size
+#define MAX_PATH 4096                      // Maximum path length
+#define MAX_HTTP_QUEUE_SIZE 128            // Maximum HTTP request queue size
+#define MAX_CALC_QUEUE_SIZE 1024           // Maximum calculation task queue size
+#define DEFAULT_MEMORY_LIMIT (20UL * 1024 * 1024 * 1024) // 20GB default limit
+#define MIN_CHUNK_SIZE (1024*1024)         // Minimum chunk size of 1MB
+#define MAX_CHUNK_SIZE (512*1024*1024)     // Maximum chunk size of 512MB
+#define MAX_JOBS 100                       // Maximum concurrent calculation jobs
+#define MAX_JOB_AGE_SECONDS 86400          // Maximum age of completed jobs (1 day)
+#define MAX_JOB_ERROR_MSG 256              // Maximum length of job error message
+
+// Algorithm constants
+// Gauss-Legendre
+#define GL_DEFAULT_ITERATIONS 10           // Default iterations for Gauss-Legendre
+#define GL_PRECISION_BITS 128              // Additional bits for GL precision
+
+// Chudnovsky
+#define A 13591409                         // Chudnovsky algorithm constant A
+#define B 545140134                        // Chudnovsky algorithm constant B
+#define C 640320                           // Chudnovsky algorithm constant C
+// Replaced overflow-causing macro with string constant
+#define C3_OVER_24_STR "10939058860032000" // Precomputed value of C*C*C/24
+
+// Algorithm selection thresholds
+#define SMALL_DIGITS_THRESHOLD 100000      // Use GL below this threshold
+#define LARGE_DIGITS_THRESHOLD 10000000    // Force out-of-core above this threshold
+
+// Logging levels
+#define LOG_LEVEL_DEBUG 0
+#define LOG_LEVEL_INFO 1
+#define LOG_LEVEL_ERROR 2
+
+// AARCH64 specific
+#define CACHE_LINE_SIZE 64                 // Typical L1 cache line size for AARCH64
+
+// String constants
+#define ALGORITHM_GL "GL"                  // Gauss-Legendre algorithm identifier
+#define ALGORITHM_CH "CH"                  // Chudnovsky algorithm identifier
+
+// Calculation modes
+#define CALC_MODE_SYNC 0                   // Synchronous calculation
+#define CALC_MODE_ASYNC 1                  // Asynchronous calculation
+
 // Forward declarations for key functions
 void* timeout_monitor_thread(void* arg);
+
+// Forward declarations of essential types and globals
+// Calculation algorithm enum
+typedef enum {
+    ALGO_GAUSS_LEGENDRE,
+    ALGO_CHUDNOVSKY
+} algorithm_t;
+
+// Out-of-core mode enum
+typedef enum {
+    OOC_AUTO,
+    OOC_FORCE,
+    OOC_DISABLE
+} out_of_core_mode_t;
+
+// Execution mode enum
+typedef enum {
+    MODE_SERVER,
+    MODE_CLI
+} execution_mode_t;
+
+// Job status enum
+typedef enum {
+    JOB_STATUS_QUEUED,
+    JOB_STATUS_RUNNING,
+    JOB_STATUS_COMPLETED,
+    JOB_STATUS_FAILED,
+    JOB_STATUS_CANCELED
+} job_status_t;
+
+// Calculation job structure forward declaration
+typedef struct calculation_job {
+    char job_id[37];                     // UUID for the job (36 chars + null)
+    algorithm_t algorithm;               // Algorithm to use
+    unsigned long digits;                // Number of digits requested
+    out_of_core_mode_t out_of_core_mode; // Out-of-core mode
+    bool checkpointing_enabled;          // Whether checkpointing is enabled
+    job_status_t status;                 // Job status
+    time_t creation_time;                // When the job was created
+    time_t start_time;                   // When calculation started
+    time_t end_time;                     // When calculation ended
+    char result_file[MAX_PATH];          // Path to the result file
+    double progress;                     // Progress (0.0 to 1.0)
+    char error_message[256];             // Error message if failed
+    pthread_mutex_t lock;                // Lock for thread safety
+} calculation_job;
+
+// Global job management
+extern calculation_job jobs[MAX_JOBS];
+extern pthread_mutex_t jobs_lock;
+extern bool g_server_running;
+extern volatile bool g_shutdown_flag;
+
+// Config structure forward declaration
+typedef struct {
+    // Server configuration
+    char ip_address[INET_ADDRSTRLEN];      // IP address to bind to
+    int port;                              // Port to listen on
+    int max_http_threads;                  // Maximum HTTP worker threads
+    int max_calc_threads;                  // Maximum calculation threads
+    
+    // Calculation configuration
+    unsigned long max_digits;              // Maximum digits allowed
+    size_t memory_limit;                   // Memory limit in bytes
+    algorithm_t default_algorithm;         // Default algorithm to use
+    int gl_iterations;                     // Iterations for Gauss-Legendre
+    int gl_precision_bits;                 // Extra precision bits for GL
+    
+    // Logging configuration
+    char logging_level[16];                // Logging level (debug, info, error)
+    char logging_output[MAX_PATH];         // Log output (console or file path)
+    struct {
+        int level;                         // Logging level (numeric)
+    } logging;
+    
+    // Disk and checkpointing
+    char work_dir[MAX_PATH];               // Working directory
+    bool checkpointing_enabled;            // Whether checkpointing is enabled
+    unsigned long checkpoint_interval;     // Interval between checkpoints (seconds)
+    
+    // Execution mode
+    execution_mode_t mode;                 // Server or CLI mode
+} config_t;
+
+extern config_t config;
+
+// Forward declaration for logging
+typedef enum {
+    LOG_OUTPUT_CONSOLE,
+    LOG_OUTPUT_FILE
+} log_output_t;
 
 // Signal handler for segmentation faults
 void segfault_handler(int sig) {
@@ -219,37 +359,6 @@ void segfault_handler(int sig) {
     _exit(1);
 }
 
-// ==========================================================================
-// Constants and Macros
-// ==========================================================================
-
-// Buffer sizes and limits
-#define BUFFER_SIZE 4096                   // General purpose buffer size
-#define MAX_PATH 4096                      // Maximum path length
-#define MAX_HTTP_QUEUE_SIZE 128            // Maximum HTTP request queue size
-#define MAX_CALC_QUEUE_SIZE 1024           // Maximum calculation task queue size
-#define DEFAULT_MEMORY_LIMIT (20UL * 1024 * 1024 * 1024) // 20GB default limit
-#define MIN_CHUNK_SIZE (1024*1024)         // Minimum chunk size of 1MB
-#define MAX_CHUNK_SIZE (512*1024*1024)     // Maximum chunk size of 512MB
-#define MAX_JOBS 100                       // Maximum concurrent calculation jobs
-#define MAX_JOB_AGE_SECONDS 86400          // Maximum age of completed jobs (1 day)
-
-// Algorithm constants
-// Gauss-Legendre
-#define GL_DEFAULT_ITERATIONS 10           // Default iterations for Gauss-Legendre
-#define GL_PRECISION_BITS 128              // Additional bits for GL precision
-
-// Chudnovsky
-#define A 13591409                         // Chudnovsky algorithm constant A
-#define B 545140134                        // Chudnovsky algorithm constant B
-#define C 640320                           // Chudnovsky algorithm constant C
-// Replaced overflow-causing macro with string constant
-#define C3_OVER_24_STR "10939058860032000" // Precomputed value of C*C*C/24
-
-// Algorithm selection thresholds
-#define SMALL_DIGITS_THRESHOLD 100000      // Use GL below this threshold
-#define LARGE_DIGITS_THRESHOLD 10000000    // Force out-of-core above this threshold
-
 // Structure definition for timeout monitor thread data
 struct timeout_monitor_data {
     time_t start_time;
@@ -258,67 +367,11 @@ struct timeout_monitor_data {
     int job_idx;
 };
 
-// AARCH64 specific
-#define CACHE_LINE_SIZE 64                 // Typical L1 cache line size for AARCH64
-
-// String constants
-#define ALGORITHM_GL "GL"                  // Gauss-Legendre algorithm identifier
-#define ALGORITHM_CH "CH"                  // Chudnovsky algorithm identifier
-
-// Calculation modes
-#define CALC_MODE_SYNC 0                   // Synchronous calculation
-#define CALC_MODE_ASYNC 1                  // Asynchronous calculation
-
 // ==========================================================================
 // Type Definitions and Data Structures
 // ==========================================================================
 
-// Calculation algorithm enum
-typedef enum {
-    ALGO_GAUSS_LEGENDRE,
-    ALGO_CHUDNOVSKY
-} algorithm_t;
-
-// Out-of-core mode enum
-typedef enum {
-    OOC_AUTO,
-    OOC_FORCE,
-    OOC_DISABLE
-} out_of_core_mode_t;
-
-// Execution mode enum
-typedef enum {
-    MODE_SERVER,
-    MODE_CLI
-} execution_mode_t;
-
-// Configuration structure
-typedef struct {
-    // Server configuration
-    char ip_address[INET_ADDRSTRLEN];      // IP address to bind to
-    int port;                              // Port to listen on
-    int max_http_threads;                  // Maximum HTTP worker threads
-    int max_calc_threads;                  // Maximum calculation threads
-    
-    // Calculation configuration
-    unsigned long max_digits;              // Maximum digits allowed
-    size_t memory_limit;                   // Memory limit in bytes
-    algorithm_t default_algorithm;         // Default algorithm to use
-    int gl_iterations;                     // Iterations for Gauss-Legendre
-    int gl_precision_bits;                 // Extra precision bits for GL
-    
-    // Logging configuration
-    char logging_level[16];                // Logging level (debug, info, error)
-    char logging_output[MAX_PATH];         // Log output (console or file path)
-    
-    // Disk and checkpointing
-    char work_dir[MAX_PATH];               // Working directory
-    bool checkpointing_enabled;            // Whether checkpointing is enabled
-    unsigned long checkpoint_interval;     // Interval between checkpoints (seconds)
-    
-    // Execution mode
-    execution_mode_t mode;                 // Server or CLI mode
-} config_t;
+// Use config_t structure already defined earlier in the code
 
 // Forward declarations of major structures
 typedef struct disk_int disk_int;
@@ -1900,31 +1953,9 @@ void http_thread_pool_shutdown(http_thread_pool* pool) {
 // Job Management for Asynchronous Calculations
 // ==========================================================================
 
-// Job status enum
-typedef enum {
-    JOB_STATUS_QUEUED,
-    JOB_STATUS_RUNNING,
-    JOB_STATUS_COMPLETED,
-    JOB_STATUS_FAILED,
-    JOB_STATUS_CANCELED
-} job_status_t;
-
-// Calculation job structure for asynchronous requests
-struct calculation_job {
-    char job_id[37];                     // UUID for the job (36 chars + null)
-    algorithm_t algorithm;               // Algorithm to use
-    unsigned long digits;                // Number of digits requested
-    out_of_core_mode_t out_of_core_mode; // Out-of-core mode
-    bool checkpointing_enabled;          // Whether checkpointing is enabled
-    job_status_t status;                 // Job status
-    time_t creation_time;                // When the job was created
-    time_t start_time;                   // When calculation started
-    time_t end_time;                     // When calculation ended
-    char result_file[MAX_PATH];          // Path to the result file
-    double progress;                     // Progress (0.0 to 1.0)
-    char error_message[256];             // Error message if failed
-    pthread_mutex_t lock;                // Lock for thread safety
-};
+//
+// Below, we use the previously defined calculation_job structure
+//
 
 // Jobs array and management
 calculation_job jobs[MAX_JOBS];
@@ -2847,17 +2878,24 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
 // File pointer for logging
 FILE* log_file = NULL;
 
-// Log message with timestamp and level
-void log_message(const char* level, const char* message) {
+// Log message with timestamp and level (supports printf-style formats)
+void log_message(const char* level, const char* format, ...) {
     // Get current time
     time_t now = time(NULL);
     struct tm* tm_info = localtime(&now);
     char timestamp[20];
     strftime(timestamp, 20, "%Y-%m-%d %H:%M:%S", tm_info);
     
+    // Format the variadic message
+    char formatted_message[BUFFER_SIZE];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(formatted_message, BUFFER_SIZE, format, args);
+    va_end(args);
+    
     // Create log message with format: [timestamp] level: message
     char log_output[BUFFER_SIZE];
-    snprintf(log_output, BUFFER_SIZE, "[%s] %s: %s", timestamp, level, message);
+    snprintf(log_output, BUFFER_SIZE, "[%s] %s: %s", timestamp, level, formatted_message);
     
     // Output to console or file based on configuration
     if (log_file) {
@@ -2890,6 +2928,10 @@ void close_log_file() {
 // ==========================================================================
 // Configuration Loading and Management
 // ==========================================================================
+
+// Global state flags
+bool g_server_running = false;  // Server active flag
+volatile bool g_shutdown_flag = false;   // Shutdown requested flag
 
 // Global configuration
 config_t config;
@@ -4136,7 +4178,8 @@ void* handle_http_request(void* arg) {
 http_thread_pool* g_http_pool = NULL;
 calc_thread_pool* g_calc_pool = NULL;
 int g_server_sock = -1;
-volatile int g_shutdown_flag = 0;
+// Make g_shutdown_flag volatile for atomic access
+extern volatile bool g_shutdown_flag;
 
 // Handle SIGINT (Ctrl+C) - graceful shutdown
 // Static flag to prevent multiple calls to handle_sigint
