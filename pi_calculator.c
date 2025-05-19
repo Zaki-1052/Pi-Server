@@ -562,15 +562,32 @@ int load_chunk(disk_int* d_int, size_t chunk_idx) {
     
     // Read chunk data
     size_t read_items = fread(d_int->cache, sizeof(mp_limb_t), chunk_size, f);
+    
+    // Check for read errors before closing the file
+    int ferror_result = ferror(f);
     fclose(f);
     
-    if (read_items != chunk_size) {
-        // Handle read error or partial read
-        // Fill the rest with zeros if partial read
-        if (read_items < chunk_size) {
-            memset((char*)d_int->cache + read_items * sizeof(mp_limb_t), 
-                   0, (chunk_size - read_items) * sizeof(mp_limb_t));
-        }
+    // Complete read failure - likely indicates corruption
+    if (read_items == 0 && chunk_size > 0) {
+        fprintf(stderr, "ERROR: Complete read failure for chunk %s (expected %zu limbs, got 0)\n", 
+                chunk_path, chunk_size);
+        return -1; // Report error instead of silently corrupting data
+    }
+    
+    // Error during read
+    if (ferror_result) {
+        fprintf(stderr, "ERROR: I/O error reading chunk %s (read %zu/%zu limbs)\n", 
+                chunk_path, read_items, chunk_size);
+        return -1; // Report error instead of silently corrupting data
+    }
+    
+    // Partial read (can happen at EOF)
+    if (read_items < chunk_size) {
+        fprintf(stderr, "WARNING: Partial read for chunk %s (read %zu/%zu limbs). Padding with zeros.\n",
+                chunk_path, read_items, chunk_size);
+        // Fill the rest with zeros for partial reads
+        memset((char*)d_int->cache + read_items * sizeof(mp_limb_t), 
+               0, (chunk_size - read_items) * sizeof(mp_limb_t));
     }
     
     d_int->cache_chunk_idx = chunk_idx;
@@ -1108,8 +1125,14 @@ void disk_int_get_mpz(mpz_t mpz_val, disk_int* d_int) {
         }
         
         // Load this chunk
-        if (load_chunk(d_int, chunk_idx) != 0) {
-            fprintf(stderr, "Error: Failed to load chunk %zu in disk_int_get_mpz\n", chunk_idx);
+        int load_result = load_chunk(d_int, chunk_idx);
+        if (load_result != 0) {
+            fprintf(stderr, "ERROR: Failed to load chunk %zu in disk_int_get_mpz for %s (error code: %d)\n", 
+                    chunk_idx, d_int->file_path, load_result);
+            fprintf(stderr, "CRITICAL: This indicates possible data corruption and will likely affect calculation results!\n");
+            
+            // In production code we might consider retrying or more aggressive error handling here
+            // For now, report error and set to zero, but make it very clear in the logs
             free(limbs);
             pthread_mutex_unlock(&d_int->lock);
             mpz_set_ui(mpz_val, 0); // Set to zero on error
@@ -2097,8 +2120,8 @@ void add_product_to_result(disk_int* result, mp_limb_t* product, size_t product_
 // Multiply two disk integers with memory optimization
 void disk_int_mul(disk_int* result, disk_int* a, disk_int* b) {
     // For cases where either number is zero
-    if ((a->total_size_in_limbs == 0 || a->sign == 0) || 
-        (b->total_size_in_limbs == 0 || b->sign == 0)) {
+    // Only check total_size_in_limbs - sign==0 is NOT a reliable indicator!
+    if (a->total_size_in_limbs == 0 || b->total_size_in_limbs == 0) {
         // Set result to zero
         result->total_size_in_limbs = 0;
         result->sign = 0;
