@@ -4746,9 +4746,6 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         fclose(f);
     }
     
-    mpfr_clear(mpfr_pi);
-    mpfr_clear(mpfr_temp);
-    
     printf("Pi calculation complete! Result saved to %s\n", state->output_file);
     
     // Update job status
