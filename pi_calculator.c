@@ -786,6 +786,9 @@ int mkdir_recursive(const char* path, mode_t mode) {
     return 0;
 }
 
+// Add a global mutex for disk_int_init static variables
+static pthread_mutex_t g_disk_int_init_lock = PTHREAD_MUTEX_INITIALIZER;
+
 // Initialize a disk integer
 void disk_int_init(disk_int* d_int, const char* base_path) {
     printf("DEBUG: disk_int_init with base_path=%s\n", base_path ? base_path : "NULL");
@@ -810,15 +813,21 @@ void disk_int_init(disk_int* d_int, const char* base_path) {
     // Create a unique directory name for this disk integer based on PID and timestamp
     static int counter = 0;
     static long timestamp = 0;
+    int local_counter_val; // Use a local variable to hold the counter for snprintf
+    long local_timestamp_val; // Use a local variable for the timestamp
     
-    // Initialize timestamp if not done
+    // Lock before accessing shared static variables
+    pthread_mutex_lock(&g_disk_int_init_lock);
     if (timestamp == 0) {
         timestamp = time(NULL);
     }
+    local_timestamp_val = timestamp; // Copy to local after ensuring initialization
+    local_counter_val = counter++;   // Get current counter value then increment
+    pthread_mutex_unlock(&g_disk_int_init_lock);
     
-    // Create a unique path for this disk integer
+    // Create a unique path for this disk integer using local copies of values
     snprintf(d_int->file_path, MAX_PATH, "%s/int_%d_%ld_%d", 
-             base_path, (int)getpid(), timestamp, counter++);
+             base_path, (int)getpid(), local_timestamp_val, local_counter_val);
     printf("DEBUG: Generated base path: %s\n", d_int->file_path);
     
     // Check if the base directory exists first
@@ -1127,26 +1136,18 @@ void disk_int_get_mpz(mpz_t mpz_val, disk_int* d_int) {
         d_int->cache = NULL;
     }
     
-    // Find the effective size by skipping leading zeros
+    // Find the effective size by skipping trailing zeros (at most significant end)
+    // since we import in -1 order (least significant limb first)
     size_t effective_size = d_int->total_size_in_limbs;
-    size_t start_idx = 0;
     
-    for (size_t i = 0; i < d_int->total_size_in_limbs; i++) {
-        if (limbs[i] != 0) {
-            start_idx = i;
-            effective_size = d_int->total_size_in_limbs - i;
-            break;
-        }
-        
-        // If we've checked all limbs and found no non-zero value
-        if (i == d_int->total_size_in_limbs - 1) {
-            effective_size = 0; // All zeros
-        }
+    // Scan from the most significant limb (end of array) downward for non-zero values
+    while (effective_size > 0 && limbs[effective_size-1] == 0) {
+        effective_size--;
     }
     
-    // Set the mpz_t value, skipping leading zeros
+    // Set the mpz_t value directly - no skipping at the least significant end (start of array)
     if (effective_size > 0) {
-        mpz_import(mpz_val, effective_size, -1, sizeof(mp_limb_t), 0, 0, limbs + start_idx);
+        mpz_import(mpz_val, effective_size, -1, sizeof(mp_limb_t), 0, 0, limbs);
     } else {
         mpz_set_ui(mpz_val, 0);
     }
@@ -1158,51 +1159,13 @@ void disk_int_get_mpz(mpz_t mpz_val, disk_int* d_int) {
     
     // Verify the value is non-zero after import, especially for P and T
     if (mpz_sgn(mpz_val) == 0 && d_int->total_size_in_limbs > 0) {
-        // If the value is zero but we expected non-zero data, this indicates a data corruption
-        // or import issue with large integers. Let's try to reconstruct the value from limbs directly.
+        // If the value is zero but we expected non-zero data, this indicates potential data corruption
+        // This should be rare now with the fixed mpz_import logic, but log it for diagnostics
+        fprintf(stderr, "WARNING: Zero value detected after import for %s (total_size: %zu limbs)\n", 
+                d_int->file_path, d_int->total_size_in_limbs);
         
-        // First check all limbs to see if any are non-zero (not just limb[0])
-        mp_limb_t first_non_zero_limb = 0;
-        size_t non_zero_idx = 0;
-        bool found_non_zero = false;
-        
-        for (size_t i = 0; i < d_int->total_size_in_limbs; i++) {
-            if (limbs[i] != 0) {
-                first_non_zero_limb = limbs[i];
-                non_zero_idx = i;
-                found_non_zero = true;
-                break;
-            }
-        }
-        
-        if (found_non_zero) {
-            // If any limb is non-zero, use it to set mpz_val
-            fprintf(stderr, "DEBUG: Recovering non-zero value from limbs[%zu]=%lu for %s\n", 
-                    non_zero_idx, (unsigned long)first_non_zero_limb, d_int->file_path);
-            
-            // Create a proper mpz value using this limb, shifted if necessary
-            mpz_t temp;
-            mpz_init(temp);
-            mpz_set_ui(temp, (unsigned long)first_non_zero_limb);
-            
-            // Shift by the appropriate amount based on the index
-            if (non_zero_idx > 0) {
-                mpz_mul_2exp(temp, temp, GMP_NUMB_BITS * non_zero_idx);
-            }
-            
-            // Copy to the destination
-            mpz_set(mpz_val, temp);
-            
-            // Apply sign if needed
-            if (d_int->sign < 0) {
-                mpz_neg(mpz_val, mpz_val);
-            }
-            
-            mpz_clear(temp);
-        } else {
-            fprintf(stderr, "WARNING: Zero value detected after import for %s (total_size: %zu limbs)\n", 
-                    d_int->file_path, d_int->total_size_in_limbs);
-        }
+        // No need to attempt recovery as we've fixed the root cause
+        // Just log the issue and continue with the zero value
     }
     
     free(limbs);
