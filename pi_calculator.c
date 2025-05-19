@@ -1020,12 +1020,12 @@ void disk_int_set_mpz(disk_int* d_int, mpz_t mpz_val) {
             }
         }
         
-        // Ensure the first limb of the first chunk is non-zero if we have a non-zero value
-        if (chunk_idx == 0 && sign != 0 && ((mp_limb_t*)d_int->cache)[0] == 0 && first_limb != 0) {
-            fprintf(stderr, "DEBUG: Correcting first limb from 0 to %lu for %s\n", 
-                  (unsigned long)first_limb, d_int->file_path);
-            ((mp_limb_t*)d_int->cache)[0] = first_limb;
-        }
+        // We no longer need the band-aid fix since we properly handle leading zeros in mpz_import
+        // This was previously forcing the first limb to be non-zero, but that doesn't 
+        // fix the issue if we have many leading zeros (>200) in the number
+        
+        // Now we properly find the first non-zero limb when importing, allowing
+        // large numbers with many leading zeros to be handled correctly
         
         // Set the cache chunk index and mark as dirty
         d_int->cache_chunk_idx = chunk_idx;
@@ -1127,11 +1127,32 @@ void disk_int_get_mpz(mpz_t mpz_val, disk_int* d_int) {
         d_int->cache = NULL;
     }
     
-    // Set the mpz_t value
-    mpz_import(mpz_val, d_int->total_size_in_limbs, -1, sizeof(mp_limb_t), 0, 0, limbs);
+    // Find the effective size by skipping leading zeros
+    size_t effective_size = d_int->total_size_in_limbs;
+    size_t start_idx = 0;
+    
+    for (size_t i = 0; i < d_int->total_size_in_limbs; i++) {
+        if (limbs[i] != 0) {
+            start_idx = i;
+            effective_size = d_int->total_size_in_limbs - i;
+            break;
+        }
+        
+        // If we've checked all limbs and found no non-zero value
+        if (i == d_int->total_size_in_limbs - 1) {
+            effective_size = 0; // All zeros
+        }
+    }
+    
+    // Set the mpz_t value, skipping leading zeros
+    if (effective_size > 0) {
+        mpz_import(mpz_val, effective_size, -1, sizeof(mp_limb_t), 0, 0, limbs + start_idx);
+    } else {
+        mpz_set_ui(mpz_val, 0);
+    }
     
     // Set the correct sign
-    if (d_int->sign < 0) {
+    if (d_int->sign < 0 && effective_size > 0) {
         mpz_neg(mpz_val, mpz_val);
     }
     
@@ -1145,7 +1166,7 @@ void disk_int_get_mpz(mpz_t mpz_val, disk_int* d_int) {
         size_t non_zero_idx = 0;
         bool found_non_zero = false;
         
-        for (size_t i = 0; i < d_int->total_size_in_limbs && i < 200; i++) {
+        for (size_t i = 0; i < d_int->total_size_in_limbs; i++) {
             if (limbs[i] != 0) {
                 first_non_zero_limb = limbs[i];
                 non_zero_idx = i;
@@ -4605,8 +4626,6 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     if (!mpfr_number_p(mpfr_pi)) {
         fprintf(stderr, "WARNING: Pi calculation resulted in a non-numeric value (NaN or Inf)\n");
         fprintf(stderr, "This usually indicates a division by zero or invalid operation\n");
-        // Set to a default value to avoid segfault
-        mpfr_set_d(mpfr_pi, 3.14159265358979323846, MPFR_RNDN);
     }
     
     // Clean up mpz variables (but not mpfr ones yet as we need them for output)
