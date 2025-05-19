@@ -290,6 +290,8 @@ void segfault_handler(int sig) {
 // Non-signal function that can be called by a monitoring thread to perform thorough crash logging
 void perform_crash_logging(const char *crash_log_path) {
     char buf[256];
+    // Variable for tracking system command results
+    int sys_result;
     time_t now;
     struct tm *tm_info;
     FILE *crash_log = NULL;
@@ -343,15 +345,15 @@ void perform_crash_logging(const char *crash_log_path) {
         fprintf(crash_log, "Stack trace not available on macOS in segfault handler\n");
     }
 #else
-    // Try different backtrace utilities
-    int sys_result = system("backtrace $PPID 2>/dev/null || "
-                           "gdb -ex 'set pagination 0' -ex 'thread apply all bt' -ex 'quit' -p $$ 2>/dev/null || "
-                           "echo 'Backtrace utilities not available'");
+    // For other systems, try different backtrace utilities
+    sys_result = system("backtrace $PPID 2>/dev/null || "
+                       "gdb -ex 'set pagination 0' -ex 'thread apply all bt' -ex 'quit' -p $$ 2>/dev/null || "
+                       "echo 'Backtrace utilities not available'");
     if (sys_result == -1) {
         fprintf(stderr, "Failed to execute backtrace command\n");
     }
 #endif
-    
+
     // Log memory info if possible
     fprintf(stderr, "Memory info:\n");
     if (crash_log) {
@@ -410,8 +412,19 @@ void perform_crash_logging(const char *crash_log_path) {
                 if (dir_len + suffix_len + 1 > MAX_PATH) {
                     fprintf(stderr, "Error: Checkpoint path would be too long\n");
                 } else {
-                    snprintf(checkpoint_path, sizeof(checkpoint_path), "%s/job_%s_crash_checkpoint.json",
-                            config.work_dir, jobs[i].job_id);
+                    // Use a more defensive approach to prevent truncation
+                    char filename[MAX_PATH/2];
+                    snprintf(filename, sizeof(filename), "job_%s_crash_checkpoint.json", jobs[i].job_id);
+                    
+                    // Ensure we have enough space for path + filename
+                    if (dir_len + 1 + strlen(filename) < MAX_PATH) {
+                        snprintf(checkpoint_path, sizeof(checkpoint_path), "%s/%s",
+                                config.work_dir, filename);
+                    } else {
+                        // If it would exceed the buffer, use just the filename in current directory
+                        strncpy(checkpoint_path, filename, MAX_PATH-1);
+                        checkpoint_path[MAX_PATH-1] = '\0';
+                    }
                     
                     FILE *checkpoint = fopen(checkpoint_path, "w");
                     if (checkpoint) {
@@ -5096,9 +5109,31 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
                         trunc_path[sizeof(trunc_path)-1] = '\0';
                     }
                     
+                    // Further ensure no truncation by using a predefined error message
+                    // Extract only the filename part for inclusion in the error message
+                    const char* short_name = strrchr(trunc_path, '/');
+                    if (short_name) {
+                        short_name++; // Skip the '/'
+                    } else {
+                        short_name = trunc_path; // Use as is if no slash
+                    }
+                    
+                    // Create a filename of limited length if needed
+                    char limit_name[64]; // Small enough to fit in the error message
+                    if (strlen(short_name) > 60) {
+                        // Truncate to a safe size
+                        strncpy(limit_name, short_name, 57);
+                        limit_name[57] = '.';
+                        limit_name[58] = '.';
+                        limit_name[59] = '.';
+                        limit_name[60] = '\0';
+                    } else {
+                        strcpy(limit_name, short_name);
+                    }
+                    
                     snprintf(error_message, sizeof(error_message), 
                              "Calculation failed: mpfr_get_str returned NULL, error report: %s", 
-                             trunc_path);
+                             limit_name);
                     update_job_status(state->job_idx, JOB_STATUS_FAILED, 1.0, error_message);
                 }
             }
@@ -6689,8 +6724,19 @@ void handle_sigint(int sig) {
                 // Use a simple filename instead
                 snprintf(checkpoint_path, sizeof(checkpoint_path), "job_%s_shutdown.json", jobs[i].job_id);
             } else {
-                snprintf(checkpoint_path, sizeof(checkpoint_path), "%s/job_%s_shutdown_checkpoint.json",
-                        config.work_dir, jobs[i].job_id);
+                // Use a more defensive approach to prevent truncation
+                char filename[MAX_PATH/2];
+                snprintf(filename, sizeof(filename), "job_%s_shutdown_checkpoint.json", jobs[i].job_id);
+                
+                // Ensure we have enough space for path + filename
+                if (cp_dir_len + 1 + strlen(filename) < MAX_PATH) {
+                    snprintf(checkpoint_path, sizeof(checkpoint_path), "%s/%s",
+                            config.work_dir, filename);
+                } else {
+                    // If it would exceed the buffer, use just the filename in current directory
+                    strncpy(checkpoint_path, filename, MAX_PATH-1);
+                    checkpoint_path[MAX_PATH-1] = '\0';
+                }
             }
             
             FILE* checkpoint = fopen(checkpoint_path, "w");
