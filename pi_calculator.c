@@ -235,6 +235,7 @@ int mkdir_recursive(const char* path, mode_t mode);
 int convert_log_level_string_to_int(const char* level_str);
 void perform_crash_logging(const char *crash_log_path);
 void unified_log(int level, const char* format, ...);
+void log_message(const char* level, const char* format, ...);
 
 // Async-signal safe handler for segmentation faults
 void segfault_handler(int sig) {
@@ -258,7 +259,8 @@ void segfault_handler(int sig) {
     
     // Write a minimal message to stderr using only async-signal safe functions
     const char *msg = "CRITICAL: Caught segmentation fault. Attempting crash logging via fork()...\n";
-    write(STDERR_FILENO, msg, strlen(msg));
+    ssize_t bytes_written = write(STDERR_FILENO, msg, strlen(msg));
+    // We're in a signal handler, so we can't do much if write fails
     
     // Use fork() to create a separate process for crash logging
     // This is async-signal safe according to POSIX
@@ -267,7 +269,8 @@ void segfault_handler(int sig) {
     if (pid == -1) {
         // Fork failed, simply exit
         const char *fork_fail_msg = "CRITICAL: Fork failed for crash logging, exiting.\n";
-        write(STDERR_FILENO, fork_fail_msg, strlen(fork_fail_msg));
+        ssize_t bytes_written = write(STDERR_FILENO, fork_fail_msg, strlen(fork_fail_msg));
+        // In signal handler context, we can't do much if write fails
         _exit(1);
     } 
     else if (pid == 0) {
@@ -278,7 +281,8 @@ void segfault_handler(int sig) {
     else {
         // Parent process - exit immediately with error code
         const char *parent_msg = "Parent process exiting. Check crash log for details.\n";
-        write(STDERR_FILENO, parent_msg, strlen(parent_msg));
+        ssize_t bytes_written = write(STDERR_FILENO, parent_msg, strlen(parent_msg));
+        // In signal handler context, we can't do much if write fails
         _exit(1);
     }
 }
@@ -340,9 +344,12 @@ void perform_crash_logging(const char *crash_log_path) {
     }
 #else
     // Try different backtrace utilities
-    system("backtrace $PPID 2>/dev/null || "
-           "gdb -ex 'set pagination 0' -ex 'thread apply all bt' -ex 'quit' -p $$ 2>/dev/null || "
-           "echo 'Backtrace utilities not available'");
+    int sys_result = system("backtrace $PPID 2>/dev/null || "
+                           "gdb -ex 'set pagination 0' -ex 'thread apply all bt' -ex 'quit' -p $$ 2>/dev/null || "
+                           "echo 'Backtrace utilities not available'");
+    if (sys_result == -1) {
+        fprintf(stderr, "Failed to execute backtrace command\n");
+    }
 #endif
     
     // Log memory info if possible
@@ -353,11 +360,17 @@ void perform_crash_logging(const char *crash_log_path) {
     
     // Use platform-independent approach to get memory info
 #ifdef __APPLE__
-    system("ps -o pid,vsz,rss,command -p $$ 2>/dev/null >> pi_calculator_crash.log || echo 'Memory info not available'");
+    sys_result = system("ps -o pid,vsz,rss,command -p $$ 2>/dev/null >> pi_calculator_crash.log || echo 'Memory info not available'");
+    if (sys_result == -1) {
+        fprintf(stderr, "Failed to execute memory info command\n");
+    }
 #else
-    system("cat /proc/self/status 2>/dev/null | grep -i 'VmSize\\|VmRSS' >> pi_calculator_crash.log || "
-           "ps -o pid,vsz,rss,cmd -p $$ 2>/dev/null >> pi_calculator_crash.log || "
-           "echo 'Memory info not available'");
+    sys_result = system("cat /proc/self/status 2>/dev/null | grep -i 'VmSize\\|VmRSS' >> pi_calculator_crash.log || "
+                      "ps -o pid,vsz,rss,cmd -p $$ 2>/dev/null >> pi_calculator_crash.log || "
+                      "echo 'Memory info not available'");
+    if (sys_result == -1) {
+        fprintf(stderr, "Failed to execute memory info command\n");
+    }
 #endif
     
     // Log active jobs information
@@ -676,7 +689,7 @@ int save_chunk(disk_int* d_int, size_t chunk_idx) {
         ptrdiff_t diff = last_slash - chunk_path;
         if (diff < 0) {
             log_message("error", "Invalid path structure detected");
-            return;
+            return -1;
         }
         size_t dir_len = (size_t)diff;
         
@@ -684,7 +697,7 @@ int save_chunk(disk_int* d_int, size_t chunk_idx) {
         // strncpy doesn't guarantee null-termination if source is >= dir_len
         if (dir_len >= MAX_PATH) {
             log_message("error", "Directory path too long");
-            return;
+            return -1;
         }
         strncpy(dir_path, chunk_path, dir_len);
         dir_path[dir_len] = '\0';
@@ -1673,7 +1686,7 @@ void disk_int_sub_abs(disk_int* result, disk_int* a, disk_int* b) {
         ptrdiff_t diff = most_sig_limb - (mp_limb_t*)result->cache;
         if (diff < 0) {
             log_message("error", "Invalid limb pointer detected");
-            return -1;
+            return;
         }
         size_t offset = (size_t)diff;
         result->total_size_in_limbs = most_sig_chunk * result->chunk_size + offset + 1;
@@ -3155,7 +3168,10 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
             // Remove any leftover files in temp2 directory
             char cleanup_cmd[MAX_PATH * 2];
             snprintf(cleanup_cmd, sizeof(cleanup_cmd), "rm -f %s/*", temp2_path);
-            system(cleanup_cmd);
+            int sys_result = system(cleanup_cmd);
+            if (sys_result == -1) {
+                fprintf(stderr, "Warning: Failed to execute cleanup command for temp2 directory\n");
+            }
             
             // Now try to remove the directory
             if (rmdir(temp2_path) != 0) {
@@ -3168,7 +3184,10 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
             // Remove any leftover files in temp1 directory
             char cleanup_cmd[MAX_PATH * 2];
             snprintf(cleanup_cmd, sizeof(cleanup_cmd), "rm -f %s/*", temp1_path);
-            system(cleanup_cmd);
+            int sys_result = system(cleanup_cmd);
+            if (sys_result == -1) {
+                fprintf(stderr, "Warning: Failed to execute cleanup command for temp1 directory\n");
+            }
             
             // Now try to remove the directory
             if (rmdir(temp1_path) != 0) {
@@ -3181,7 +3200,10 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
             // Remove any leftover files in right directory
             char cleanup_cmd[MAX_PATH * 2];
             snprintf(cleanup_cmd, sizeof(cleanup_cmd), "rm -f %s/*", right_path);
-            system(cleanup_cmd);
+            int sys_result = system(cleanup_cmd);
+            if (sys_result == -1) {
+                fprintf(stderr, "Warning: Failed to execute cleanup command for right directory\n");
+            }
             
             // Now try to remove the directory
             if (rmdir(right_path) != 0) {
@@ -3194,7 +3216,10 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
             // Remove any leftover files in left directory
             char cleanup_cmd[MAX_PATH * 2];
             snprintf(cleanup_cmd, sizeof(cleanup_cmd), "rm -f %s/*", left_path);
-            system(cleanup_cmd);
+            int sys_result = system(cleanup_cmd);
+            if (sys_result == -1) {
+                fprintf(stderr, "Warning: Failed to execute cleanup command for left directory\n");
+            }
             
             // Now try to remove the directory
             if (rmdir(left_path) != 0) {
@@ -4019,7 +4044,7 @@ void calculation_state_init(calculation_state* state, unsigned long digits, algo
         // Cast from unsigned long (digits) to mpfr_prec_t (long) with overflow check
         if (digits > (unsigned long)LONG_MAX / 4) {
             log_message("error", "Digits value too large for precision calculation");
-            return -1;
+            return;
         }
         mpfr_prec_t precision = (mpfr_prec_t)(digits * 4) + GL_PRECISION_BITS;
         mpfr_init2(state->data.gauss_legendre.pi, precision);
@@ -4057,7 +4082,7 @@ void calculate_pi_gauss_legendre(calculation_state* state) {
     // Cast from unsigned long (state->digits) to mpfr_prec_t (long) with overflow check
     if (state->digits > (unsigned long)LONG_MAX / 4) {
         log_message("error", "Digits value too large for precision calculation");
-        return -1;
+        return;
     }
     mpfr_prec_t precision = (mpfr_prec_t)(state->digits * 4) + GL_PRECISION_BITS;
     
@@ -4295,7 +4320,10 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     printf("DEBUG: Removing existing split directory to ensure clean state\n");
     char rm_cmd[MAX_PATH + 20];
     snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf %s", split_path);
-    system(rm_cmd);
+    int sys_result = system(rm_cmd);
+    if (sys_result == -1) {
+        fprintf(stderr, "Warning: Failed to execute directory cleanup command\n");
+    }
     
     // Now create fresh split directory
     if (mkdir_recursive(split_path, 0755) != 0) {
@@ -5634,10 +5662,10 @@ void* calculation_thread_func(void* arg) {
     calculation_state state = {0};
     // TODO: Implement pool usage or remove in future update
     // calc_thread_pool pool = {0};
-    // bool pool_initialized = false;
+    bool pool_initialized = false;
     bool state_initialized = false;
-    // TODO: Implement result usage or remove in future update
-    // int result = 0;
+    // Variable needed for tracking function result
+    int result = 0;
     
     // Check for null argument
     if (!arg) {
@@ -5914,7 +5942,10 @@ void handle_calculation_request(int client_sock, const char* algo_str, const cha
                     "Content-Length: %zu\r\n\r\n%s", 
                     strlen(json_str), json_str);
             
-            write(client_sock, http_response_buf, strlen(http_response_buf));
+            ssize_t bytes_written = write(client_sock, http_response_buf, strlen(http_response_buf));
+            if (bytes_written < 0) {
+                fprintf(stderr, "Error writing to socket: %s\n", strerror(errno));
+            }
             json_object_put(response);
             close(client_sock);
             return;
@@ -6642,7 +6673,10 @@ void handle_sigint(int sig) {
     char cleanup_cmd[MAX_PATH * 2];
     snprintf(cleanup_cmd, sizeof(cleanup_cmd), "find %s -type d -name 'temp*' -exec rm -rf {} \\; 2>/dev/null || true", 
              config.work_dir);
-    system(cleanup_cmd);
+    int sys_result = system(cleanup_cmd);
+    if (sys_result == -1) {
+        fprintf(stderr, "Warning: Failed to execute final cleanup command\n");
+    }
     
     // Flush and close log file
     log_message("info", "Closing log file and cleaning up resources...");
