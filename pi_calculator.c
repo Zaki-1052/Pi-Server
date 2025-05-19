@@ -1581,8 +1581,8 @@ void disk_int_sub_abs(disk_int* result, disk_int* a, disk_int* b) {
 
 // Add two disk integers: result = a + b
 void disk_int_add(disk_int* result, disk_int* a, disk_int* b) {
-    // Handle cases with zero
-    if (a->total_size_in_limbs == 0 || a->sign == 0) {
+    // Handle cases with zero - only check total_size_in_limbs, never sign
+    if (a->total_size_in_limbs == 0) {
         // a is zero, result = b
         mpz_t mpz_b;
         mpz_init(mpz_b);
@@ -1592,7 +1592,7 @@ void disk_int_add(disk_int* result, disk_int* a, disk_int* b) {
         return;
     }
     
-    if (b->total_size_in_limbs == 0 || b->sign == 0) {
+    if (b->total_size_in_limbs == 0) {
         // b is zero, result = a
         mpz_t mpz_a;
         mpz_init(mpz_a);
@@ -4286,14 +4286,38 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         mpz_t mpz_temp;
         mpz_init(mpz_temp);
         
+        // Set initial P from chunk 0
         disk_int_get_mpz(mpz_temp, &chunk_results[0].P);
+        printf("DEBUG: Initial P from chunk 0: %s\n", mpz_get_str(NULL, 10, mpz_temp));
         disk_int_set_mpz(&combined_state.P, mpz_temp);
         
+        // Set initial Q from chunk 0
         disk_int_get_mpz(mpz_temp, &chunk_results[0].Q);
+        printf("DEBUG: Initial Q from chunk 0: %s\n", mpz_get_str(NULL, 10, mpz_temp));
         disk_int_set_mpz(&combined_state.Q, mpz_temp);
         
+        // Set initial T from chunk 0
         disk_int_get_mpz(mpz_temp, &chunk_results[0].T);
+        printf("DEBUG: Initial T from chunk 0: %s\n", mpz_get_str(NULL, 10, mpz_temp));
         disk_int_set_mpz(&combined_state.T, mpz_temp);
+        
+        // Verify combined state was initialized correctly
+        mpz_t verify_p, verify_q, verify_t;
+        mpz_init(verify_p);
+        mpz_init(verify_q);
+        mpz_init(verify_t);
+        
+        disk_int_get_mpz(verify_p, &combined_state.P);
+        disk_int_get_mpz(verify_q, &combined_state.Q);
+        disk_int_get_mpz(verify_t, &combined_state.T);
+        
+        printf("DEBUG: After initial seeding - combined_state.P=%s\n", mpz_get_str(NULL, 10, verify_p));
+        printf("DEBUG: After initial seeding - combined_state.Q=%s\n", mpz_get_str(NULL, 10, verify_q));
+        printf("DEBUG: After initial seeding - combined_state.T=%s\n", mpz_get_str(NULL, 10, verify_t));
+        
+        mpz_clear(verify_p);
+        mpz_clear(verify_q);
+        mpz_clear(verify_t);
         
         // Combine with remaining chunks
         for (int i = 1; i < pool->num_threads; i++) {
@@ -4348,6 +4372,31 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
             disk_int_set_mpz(&combined_state.P, mpz_temp_P);
             disk_int_set_mpz(&combined_state.Q, mpz_temp_Q);
             disk_int_set_mpz(&combined_state.T, mpz_temp_T);
+            
+            // Verify combined state was updated correctly after combining with chunk i
+            mpz_t verify_p, verify_q, verify_t;
+            mpz_init(verify_p);
+            mpz_init(verify_q);
+            mpz_init(verify_t);
+            
+            disk_int_get_mpz(verify_p, &combined_state.P);
+            disk_int_get_mpz(verify_q, &combined_state.Q);
+            disk_int_get_mpz(verify_t, &combined_state.T);
+            
+            printf("DEBUG: After combining with chunk %d:\n", i);
+            printf("  - combined_state.P=%s\n", mpz_get_str(NULL, 10, verify_p));
+            printf("  - combined_state.Q=%s\n", mpz_get_str(NULL, 10, verify_q));
+            printf("  - combined_state.T=%s\n", mpz_get_str(NULL, 10, verify_t));
+            
+            // Check for zeros
+            if (mpz_sgn(verify_q) == 0) {
+                printf("CRITICAL ERROR: Q became ZERO after combining with chunk %d!\n", i);
+                printf("  - temp_Q was: %s\n", mpz_get_str(NULL, 10, mpz_temp_Q));
+            }
+            
+            mpz_clear(verify_p);
+            mpz_clear(verify_q);
+            mpz_clear(verify_t);
             
             // Clean up temporary MPZ values
             mpz_clear(mpz_temp_P);
