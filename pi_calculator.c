@@ -4815,7 +4815,7 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         // Only attempt mpfr_get_str if we have a valid number
         if (mpfr_number_p(mpfr_pi)) {
             // Use mpfr_get_str with additional error checking
-            str_pi = mpfr_get_str(NULL, &exp, 10, safe_digits + 2, mpfr_pi, MPFR_RNDN);
+            str_pi = mpfr_get_str(NULL, &exp, 10, state->digits + 2, mpfr_pi, MPFR_RNDN);
         
             if (str_pi != NULL) {
                 // Check that we got valid output
