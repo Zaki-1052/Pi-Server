@@ -433,7 +433,8 @@ void perform_crash_logging(const char *crash_log_path) {
                             fprintf(crash_log, "  Saved crash checkpoint for job %s to %s\n", 
                                     jobs[i].job_id, checkpoint_path);
                         }
-                }
+                    }
+                } // Close the else block
                 
                 // Update job status if we can safely lock it
                 if (pthread_mutex_trylock(&jobs[i].lock) == 0) {
@@ -4966,9 +4967,9 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
                     
                     // Calculate path length to ensure no truncation
                     size_t dir_len = strlen(state->work_dir);
-                    char time_str[32];
-                    snprintf(time_str, sizeof(time_str), "%ld", (long)now);
-                    size_t time_len = strlen(time_str);
+                    char time_str_filename[32];
+                    snprintf(time_str_filename, sizeof(time_str_filename), "%ld", (long)now);
+                    size_t time_len = strlen(time_str_filename);
                     size_t suffix_len = strlen("/error_report_.json") + time_len;
                     
                     if (dir_len + suffix_len + 1 > MAX_PATH) {
@@ -4976,8 +4977,8 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
                         strncpy(error_file, "error_report_truncated.json", MAX_PATH-1);
                         error_file[MAX_PATH-1] = '\0';
                     } else {
-                        snprintf(error_file, sizeof(error_file), "%s/error_report_%ld.json", 
-                                state->work_dir, (long)now);
+                        snprintf(error_file, sizeof(error_file), "%s/error_report_%s.json", 
+                                state->work_dir, time_str_filename);
                     }
                     
                     FILE* error_report = fopen(error_file, "w");
@@ -5037,9 +5038,9 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
                 
                 // Calculate path length to ensure no truncation
                 size_t dir_len = strlen(state->work_dir);
-                char time_str[32];
-                snprintf(time_str, sizeof(time_str), "%ld", (long)now);
-                size_t time_len = strlen(time_str);
+                char time_str_null_err[32];
+                snprintf(time_str_null_err, sizeof(time_str_null_err), "%ld", (long)now);
+                size_t time_len = strlen(time_str_null_err);
                 size_t suffix_len = strlen("/error_report_null_.json") + time_len;
                 
                 if (dir_len + suffix_len + 1 > MAX_PATH) {
@@ -5047,8 +5048,8 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
                     strncpy(error_file, "error_report_truncated.json", MAX_PATH-1);
                     error_file[MAX_PATH-1] = '\0';
                 } else {
-                    snprintf(error_file, sizeof(error_file), "%s/error_report_null_%ld.json", 
-                            state->work_dir, (long)now);
+                    snprintf(error_file, sizeof(error_file), "%s/error_report_null_%s.json", 
+                            state->work_dir, time_str_null_err);
                 }
                 
                 FILE* error_report = fopen(error_file, "w");
