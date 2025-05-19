@@ -4436,7 +4436,8 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
             mpz_clear(mpz_temp_Q);
             mpz_clear(mpz_temp_T);
             
-            // Clean up
+            // Clean up only the temporary disk_int objects
+            // We MUST NOT clear combined_state.P/Q/T here as they're needed for the next iteration
             disk_int_clear(&temp_P);
             disk_int_clear(&temp_Q);
             disk_int_clear(&temp_T1);
