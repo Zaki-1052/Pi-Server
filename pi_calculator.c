@@ -400,29 +400,39 @@ void perform_crash_logging(const char *crash_log_path) {
                 
                 // Attempt to save a checkpoint for this job
                 char checkpoint_path[MAX_PATH];
-                snprintf(checkpoint_path, sizeof(checkpoint_path), "%s/job_%s_crash_checkpoint.json",
-                         config.work_dir, jobs[i].job_id);
                 
-                FILE *checkpoint = fopen(checkpoint_path, "w");
-                if (checkpoint) {
-                    fprintf(checkpoint, "{\n");
-                    fprintf(checkpoint, "  \"job_id\": \"%s\",\n", jobs[i].job_id);
-                    fprintf(checkpoint, "  \"algorithm\": \"%s\",\n", 
-                            jobs[i].algorithm == ALGO_CHUDNOVSKY ? "CH" : "GL");
-                    fprintf(checkpoint, "  \"digits\": %lu,\n", jobs[i].digits);
-                    fprintf(checkpoint, "  \"progress\": %.6f,\n", jobs[i].progress);
-                    fprintf(checkpoint, "  \"status\": \"crashed\",\n");
-                    fprintf(checkpoint, "  \"crash_time\": %ld,\n", (long)now);
-                    fprintf(checkpoint, "  \"error\": \"Calculation terminated by segmentation fault\"\n");
-                    fprintf(checkpoint, "}\n");
-                    fclose(checkpoint);
+                // Calculate length to ensure no truncation
+                size_t dir_len = strlen(config.work_dir);
+                size_t id_len = strlen(jobs[i].job_id);
+                size_t suffix_len = strlen("/job__crash_checkpoint.json") + id_len;
+                
+                // Check if the path would exceed the buffer size
+                if (dir_len + suffix_len + 1 > MAX_PATH) {
+                    fprintf(stderr, "Error: Checkpoint path would be too long\n");
+                } else {
+                    snprintf(checkpoint_path, sizeof(checkpoint_path), "%s/job_%s_crash_checkpoint.json",
+                            config.work_dir, jobs[i].job_id);
                     
-                    fprintf(stderr, "  Saved crash checkpoint for job %s to %s\n", 
-                            jobs[i].job_id, checkpoint_path);
-                    if (crash_log) {
-                        fprintf(crash_log, "  Saved crash checkpoint for job %s to %s\n", 
+                    FILE *checkpoint = fopen(checkpoint_path, "w");
+                    if (checkpoint) {
+                        fprintf(checkpoint, "{\n");
+                        fprintf(checkpoint, "  \"job_id\": \"%s\",\n", jobs[i].job_id);
+                        fprintf(checkpoint, "  \"algorithm\": \"%s\",\n", 
+                                jobs[i].algorithm == ALGO_CHUDNOVSKY ? "CH" : "GL");
+                        fprintf(checkpoint, "  \"digits\": %lu,\n", jobs[i].digits);
+                        fprintf(checkpoint, "  \"progress\": %.6f,\n", jobs[i].progress);
+                        fprintf(checkpoint, "  \"status\": \"crashed\",\n");
+                        fprintf(checkpoint, "  \"crash_time\": %ld,\n", (long)now);
+                        fprintf(checkpoint, "  \"error\": \"Calculation terminated by segmentation fault\"\n");
+                        fprintf(checkpoint, "}\n");
+                        fclose(checkpoint);
+                        
+                        fprintf(stderr, "  Saved crash checkpoint for job %s to %s\n", 
                                 jobs[i].job_id, checkpoint_path);
-                    }
+                        if (crash_log) {
+                            fprintf(crash_log, "  Saved crash checkpoint for job %s to %s\n", 
+                                    jobs[i].job_id, checkpoint_path);
+                        }
                 }
                 
                 // Update job status if we can safely lock it
@@ -4953,8 +4963,22 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
                     
                     // Create error report file for diagnostics
                     char error_file[MAX_PATH];
-                    snprintf(error_file, sizeof(error_file), "%s/error_report_%ld.json", 
-                             state->work_dir, (long)now);
+                    
+                    // Calculate path length to ensure no truncation
+                    size_t dir_len = strlen(state->work_dir);
+                    char time_str[32];
+                    snprintf(time_str, sizeof(time_str), "%ld", (long)now);
+                    size_t time_len = strlen(time_str);
+                    size_t suffix_len = strlen("/error_report_.json") + time_len;
+                    
+                    if (dir_len + suffix_len + 1 > MAX_PATH) {
+                        fprintf(stderr, "Error: Error report path would be too long\n");
+                        strncpy(error_file, "error_report_truncated.json", MAX_PATH-1);
+                        error_file[MAX_PATH-1] = '\0';
+                    } else {
+                        snprintf(error_file, sizeof(error_file), "%s/error_report_%ld.json", 
+                                state->work_dir, (long)now);
+                    }
                     
                     FILE* error_report = fopen(error_file, "w");
                     if (error_report) {
@@ -5010,8 +5034,22 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
             
                 // Create error report file for diagnostics
                 char error_file[MAX_PATH];
-                snprintf(error_file, sizeof(error_file), "%s/error_report_null_%ld.json", 
-                         state->work_dir, (long)now);
+                
+                // Calculate path length to ensure no truncation
+                size_t dir_len = strlen(state->work_dir);
+                char time_str[32];
+                snprintf(time_str, sizeof(time_str), "%ld", (long)now);
+                size_t time_len = strlen(time_str);
+                size_t suffix_len = strlen("/error_report_null_.json") + time_len;
+                
+                if (dir_len + suffix_len + 1 > MAX_PATH) {
+                    fprintf(stderr, "Error: Error report path would be too long\n");
+                    strncpy(error_file, "error_report_truncated.json", MAX_PATH-1);
+                    error_file[MAX_PATH-1] = '\0';
+                } else {
+                    snprintf(error_file, sizeof(error_file), "%s/error_report_null_%ld.json", 
+                            state->work_dir, (long)now);
+                }
                 
                 FILE* error_report = fopen(error_file, "w");
                 if (error_report) {
@@ -5034,9 +5072,32 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
                 // Update job status if this is part of a job
                 if (state->job_idx >= 0) {
                     char error_message[MAX_JOB_ERROR_MSG];
+                    
+                    // Calculate max length for error file path in message
+                    size_t prefix_len = strlen("Calculation failed: mpfr_get_str returned NULL, error report: ");
+                    size_t max_file_path = MAX_JOB_ERROR_MSG - prefix_len - 1; // -1 for null terminator
+                    
+                    // Truncate error file path if needed
+                    char trunc_path[MAX_JOB_ERROR_MSG];
+                    if (strlen(error_file) > max_file_path) {
+                        // If path is too long, just use the filename part
+                        const char* filename = strrchr(error_file, '/');
+                        if (filename) {
+                            filename++; // Skip the '/'
+                            strncpy(trunc_path, filename, sizeof(trunc_path)-1);
+                        } else {
+                            // No slash found, use truncated path
+                            strncpy(trunc_path, error_file, max_file_path);
+                            trunc_path[max_file_path] = '\0';
+                        }
+                    } else {
+                        strncpy(trunc_path, error_file, sizeof(trunc_path)-1);
+                        trunc_path[sizeof(trunc_path)-1] = '\0';
+                    }
+                    
                     snprintf(error_message, sizeof(error_message), 
                              "Calculation failed: mpfr_get_str returned NULL, error report: %s", 
-                             error_file);
+                             trunc_path);
                     update_job_status(state->job_idx, JOB_STATUS_FAILED, 1.0, error_message);
                 }
             }
@@ -5535,8 +5596,22 @@ void* timeout_monitor_thread(void* arg) {
     
     // Create a timeout report file
     char timeout_file[MAX_PATH];
-    snprintf(timeout_file, sizeof(timeout_file), "%s/job_%d_timeout.json", 
-             config.work_dir, job_idx);
+    
+    // Calculate length to ensure no truncation
+    size_t dir_len = strlen(config.work_dir);
+    char idx_str[32];
+    snprintf(idx_str, sizeof(idx_str), "%d", job_idx);
+    size_t idx_len = strlen(idx_str);
+    size_t suffix_len = strlen("/job__timeout.json") + idx_len;
+    
+    if (dir_len + suffix_len + 1 > MAX_PATH) {
+        fprintf(stderr, "Error: Timeout file path would be too long\n");
+        strncpy(timeout_file, "timeout_report.json", MAX_PATH-1);
+        timeout_file[MAX_PATH-1] = '\0';
+    } else {
+        snprintf(timeout_file, sizeof(timeout_file), "%s/job_%d_timeout.json", 
+                config.work_dir, job_idx);
+    }
     
     FILE* f = fopen(timeout_file, "w");
     if (f) {
@@ -6556,8 +6631,22 @@ void handle_sigint(int sig) {
     
     // Create a shutdown log for debugging
     char shutdown_log_path[MAX_PATH];
-    snprintf(shutdown_log_path, sizeof(shutdown_log_path), "%s/shutdown_log_%ld.json", 
-             config.work_dir, (long)now);
+    
+    // Calculate length to ensure no truncation
+    size_t dir_len = strlen(config.work_dir);
+    char time_str[32];
+    snprintf(time_str, sizeof(time_str), "%ld", (long)now);
+    size_t time_len = strlen(time_str);
+    size_t suffix_len = strlen("/shutdown_log_.json") + time_len;
+    
+    if (dir_len + suffix_len + 1 > MAX_PATH) {
+        fprintf(stderr, "Error: Shutdown log path would be too long\n");
+        strncpy(shutdown_log_path, "shutdown_log.json", MAX_PATH-1);
+        shutdown_log_path[MAX_PATH-1] = '\0';
+    } else {
+        snprintf(shutdown_log_path, sizeof(shutdown_log_path), "%s/shutdown_log_%ld.json", 
+                config.work_dir, (long)now);
+    }
     
     // Create directory if needed
     mkdir_recursive(config.work_dir, 0755);
@@ -6588,8 +6677,20 @@ void handle_sigint(int sig) {
             
             // Create a checkpoint file for this job
             char checkpoint_path[MAX_PATH];
-            snprintf(checkpoint_path, sizeof(checkpoint_path), "%s/job_%s_shutdown_checkpoint.json",
-                     config.work_dir, jobs[i].job_id);
+            
+            // Calculate length to ensure no truncation
+            size_t cp_dir_len = strlen(config.work_dir);
+            size_t job_id_len = strlen(jobs[i].job_id);
+            size_t cp_suffix_len = strlen("/job__shutdown_checkpoint.json") + job_id_len;
+            
+            if (cp_dir_len + cp_suffix_len + 1 > MAX_PATH) {
+                fprintf(stderr, "Error: Checkpoint path would be too long for job %s\n", jobs[i].job_id);
+                // Use a simple filename instead
+                snprintf(checkpoint_path, sizeof(checkpoint_path), "job_%s_shutdown.json", jobs[i].job_id);
+            } else {
+                snprintf(checkpoint_path, sizeof(checkpoint_path), "%s/job_%s_shutdown_checkpoint.json",
+                        config.work_dir, jobs[i].job_id);
+            }
             
             FILE* checkpoint = fopen(checkpoint_path, "w");
             if (checkpoint) {
