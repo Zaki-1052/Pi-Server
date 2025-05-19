@@ -1039,9 +1039,11 @@ void disk_int_set_mpz(disk_int* d_int, mpz_t mpz_val) {
         }
         
         // Extract the chunk from mpz_t using mpz_export to get all limbs at once
-        // This guarantees we get the actual non-zero limbs instead of potentially all zeros
+        // CRITICAL FIX: Use order=1 (most-significant first) so that the most
+        // significant limbs are at the START of the array, making offset calculations simpler
+        // and consistent with how we process the arrays in the rest of the code
         size_t count;
-        mp_limb_t *all_limbs = mpz_export(NULL, &count, -1, sizeof(mp_limb_t), 0, 0, mpz_val);
+        mp_limb_t *all_limbs = mpz_export(NULL, &count, 1, sizeof(mp_limb_t), 0, 0, mpz_val);
         
         printf("DEBUG: disk_int_set_mpz to %s: mpz_export returned %zu limbs (total_size=%zu)\n", 
                d_int->file_path, count, total_size);
@@ -1062,15 +1064,14 @@ void disk_int_set_mpz(disk_int* d_int, mpz_t mpz_val) {
                 // This is the critical fix: always include a non-zero limb in the first chunk
                 size_t limbs_to_copy = (count < chunk_size) ? count : chunk_size;
                 
-                // FIXED: Always copy from the most significant end to ensure we get non-zero values
-                // mpz_export guarantees the most significant limb is non-zero, but puts it at position count-1
-                // For Chudnovsky values with huge factor 2^K, all low-order limbs could be zero
-                // The bug only appears when count < chunk_size (small integers)
-                size_t src_offset = (count > limbs_to_copy) ? (count - limbs_to_copy) : 0;
-                memcpy(d_int->cache, all_limbs + src_offset, limbs_to_copy * sizeof(mp_limb_t));
+                // FIXED: With order=1, the most significant limbs are at the start of all_limbs
+                // For Chudnovsky values with huge factor 2^K, we want to ensure we get the
+                // non-zero limbs which are now at the beginning of the array
+                // Simply copy from the beginning of the array
+                memcpy(d_int->cache, all_limbs, limbs_to_copy * sizeof(mp_limb_t));
                 
-                printf("DEBUG: Copied most significant %zu limbs from offset %zu (total %zu limbs)\n", 
-                       limbs_to_copy, src_offset, count);
+                printf("DEBUG: Copied most significant %zu limbs (total %zu limbs)\n", 
+                       limbs_to_copy, count);
                 
                 // Ensure we're writing non-zero data
                 printf("DEBUG: First few limbs: ");
@@ -1082,44 +1083,23 @@ void disk_int_set_mpz(disk_int* d_int, mpz_t mpz_val) {
                 // For subsequent chunks that are within the range of the significant limbs
                 memset(d_int->cache, 0, chunk_size * sizeof(mp_limb_t));
                 
-                // FIXED: For subsequent chunks, also ensure we're copying the most significant limbs
-                // Need to adjust the calculation of start_pos to handle the case where we need
-                // to start from the end of the array for large numbers with many leading zeros
+                // FIXED: For subsequent chunks, with order=1 the logic is much simpler
+                // Since the most significant limbs are at the beginning, we just need to
+                // calculate which slice of the array to copy based on chunk index
                 
-                // Calculate base offset - normally chunk_idx * chunk_size
-                size_t base_offset = chunk_idx * d_int->chunk_size;
+                // Simple offset calculation - each chunk gets its own slice
+                size_t src_offset = chunk_idx * d_int->chunk_size;
                 
-                // Adjust for large numbers where we need to offset from the end
-                size_t total_chunks = (count + d_int->chunk_size - 1) / d_int->chunk_size;
-                size_t src_offset;
-                
-                if (count > d_int->chunk_size) {
-                    // For large numbers, calculate offset based on position from the end
-                    // We want the last chunk to contain the most significant limbs
-                    size_t chunks_from_end = total_chunks - chunk_idx;
-                    if (chunks_from_end * d_int->chunk_size <= count) {
-                        // This chunk is part of the significant limbs area
-                        src_offset = count - chunks_from_end * d_int->chunk_size;
-                    } else {
-                        // This chunk is in leading zeros area
-                        src_offset = 0;
-                    }
-                } else {
-                    // For small numbers, start from the beginning
-                    src_offset = base_offset;
-                    if (src_offset >= count) {
-                        src_offset = 0; // Handle empty chunks
-                    }
-                }
-                
-                // Calculate how many limbs to copy for this chunk
-                size_t limbs_to_copy;
+                // Calculate how many limbs to copy (limit by available limbs)
+                size_t limbs_to_copy = 0;
                 if (src_offset < count) {
+                    // This chunk starts within the available limbs
                     limbs_to_copy = (count - src_offset < chunk_size) ? 
                                    (count - src_offset) : chunk_size;
-                } else {
-                    limbs_to_copy = 0; // Nothing to copy from beyond the array
                 }
+                
+                // Zero the cache first
+                memset(d_int->cache, 0, chunk_size * sizeof(mp_limb_t));
                 
                 // Copy the data if there's anything to copy
                 if (limbs_to_copy > 0) {
@@ -1250,24 +1230,25 @@ void disk_int_get_mpz(mpz_t mpz_val, disk_int* d_int) {
         d_int->cache = NULL;
     }
     
-    // Find the effective size by skipping trailing zeros (at most significant end)
-    // since we import in -1 order (least significant limb first)
-    size_t effective_size = d_int->total_size_in_limbs;
+    // FIXED: Don't strip trailing zeros - use the exact number of limbs we wrote to disk
+    // This is critical because for Chudnovsky algorithm values with large 2^k factors,
+    // we might have many zeros in high order positions but still have valid non-zero data
     
-    // Scan from the most significant limb (end of array) downward for non-zero values
-    while (effective_size > 0 && limbs[effective_size-1] == 0) {
-        effective_size--;
-    }
+    // Use the full size as recorded in the disk_int, which is what we originally wrote
+    size_t import_size = d_int->total_size_in_limbs;
     
-    // Set the mpz_t value directly - no skipping at the least significant end (start of array)
-    if (effective_size > 0) {
-        mpz_import(mpz_val, effective_size, -1, sizeof(mp_limb_t), 0, 0, limbs);
+    // No need to scan for zeros - we already know how many limbs there are
+    // Using the exact recorded size ensures we faithfully preserve the original number
+    
+    // FIXED: Use order=1 to match how we export limbs, for consistent ordering
+    if (import_size > 0) {
+        mpz_import(mpz_val, import_size, 1, sizeof(mp_limb_t), 0, 0, limbs);
     } else {
         mpz_set_ui(mpz_val, 0);
     }
     
-    // Set the correct sign
-    if (d_int->sign < 0 && effective_size > 0) {
+    // Set the correct sign - using import_size instead of effective_size
+    if (d_int->sign < 0 && import_size > 0) {
         mpz_neg(mpz_val, mpz_val);
     }
     
