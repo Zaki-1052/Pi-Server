@@ -45,6 +45,7 @@
 
 // Signal handling
 #include <signal.h>
+#include <execinfo.h>
 
 // ==========================================================================
 // Constants and Macros
@@ -957,8 +958,23 @@ void disk_int_clear(disk_int* d_int) {
 // Set a disk integer from a GMP mpz_t
 void disk_int_set_mpz(disk_int* d_int, mpz_t mpz_val) {
     // Check if disk_int is properly initialized
-    if (!d_int || d_int->file_path[0] == '\0') {
-        fprintf(stderr, "Error: Disk integer not properly initialized\n");
+    if (!d_int) {
+        fprintf(stderr, "Error: NULL disk_int pointer in disk_int_set_mpz\n");
+        return;
+    }
+    
+    // Check if the file_path is empty - critically important validation
+    if (d_int->file_path[0] == '\0') {
+        fprintf(stderr, "CRITICAL ERROR: disk_int has empty file_path in disk_int_set_mpz\n");
+        fprintf(stderr, "               This suggests it was previously cleared. Aborting.\n");
+        // Print a stack trace if possible
+        void* callstack[128];
+        int frames = backtrace(callstack, 128);
+        char** strs = backtrace_symbols(callstack, frames);
+        for (int i = 0; i < frames; i++) {
+            fprintf(stderr, "   [%d] %s\n", i, strs[i]);
+        }
+        free(strs);
         return;
     }
     
@@ -1027,52 +1043,56 @@ void disk_int_set_mpz(disk_int* d_int, mpz_t mpz_val) {
         size_t count;
         mp_limb_t *all_limbs = mpz_export(NULL, &count, -1, sizeof(mp_limb_t), 0, 0, mpz_val);
         
+        printf("DEBUG: disk_int_set_mpz to %s: mpz_export returned %zu limbs (total_size=%zu)\n", 
+               d_int->file_path, count, total_size);
+        
         if (!all_limbs) {
             // If mpz_export returns NULL, the number is zero
             memset(d_int->cache, 0, chunk_size * sizeof(mp_limb_t));
             printf("DEBUG: mpz_export returned NULL - setting all limbs to zero\n");
         } else {
-            // Verify we got the expected number of limbs
-            if (count != total_size) {
-                printf("DEBUG: mpz_export returned %zu limbs, but expected %zu\n", count, total_size);
-            }
+            // For a non-zero number, use all the significant limbs
             
-            // If this is the first chunk and the exported size is smaller than total_size,
-            // it means there are leading zeros that mpz_export skipped
-            if (chunk_idx == 0 && count < total_size) {
-                // The difference is the number of leading zeros (at the most significant end)
-                size_t leading_zeros = total_size - count;
-                
-                // Fill the chunk with data from the correct position in all_limbs
-                for (size_t i = 0; i < chunk_size; i++) {
-                    if (i < leading_zeros) {
-                        // These are the skipped leading zeros
-                        ((mp_limb_t*)d_int->cache)[i] = 0;
-                    } else if (i - leading_zeros < count) {
-                        // These are the actual limbs from mpz_export
-                        ((mp_limb_t*)d_int->cache)[i] = all_limbs[i - leading_zeros];
-                    } else {
-                        // Beyond the size of the number
-                        ((mp_limb_t*)d_int->cache)[i] = 0;
-                    }
-                }
-            } else {
-                // For subsequent chunks, we copy from all_limbs starting at chunk_start
-                // but need to account for skipping leading zeros
-                size_t src_offset = (chunk_idx * d_int->chunk_size);
-                
-                // Clear the chunk first
+            // Always ensure we get at least one non-zero limb in the first chunk
+            if (chunk_idx == 0 && count > 0) {
+                // Clear the cache first
                 memset(d_int->cache, 0, chunk_size * sizeof(mp_limb_t));
                 
-                // Ensure we stay within bounds
-                if (src_offset < count) {
-                    // Determine how many limbs to copy (minimum of chunk_size and remaining limbs)
-                    size_t limbs_to_copy = (count - src_offset < chunk_size) ? 
-                                           (count - src_offset) : chunk_size;
-                    
-                    // Copy the limbs
-                    memcpy(d_int->cache, all_limbs + src_offset, limbs_to_copy * sizeof(mp_limb_t));
+                // Copy at least the most significant limb to ensure we have a non-zero value
+                // This is the critical fix: always include a non-zero limb in the first chunk
+                size_t limbs_to_copy = (count < chunk_size) ? count : chunk_size;
+                
+                // If number is large with many leading zeros, copy the most significant limbs
+                // to ensure we get actual non-zero values
+                if (limbs_to_copy == chunk_size && count > chunk_size) {
+                    // Copy from the most significant end to get non-zero data
+                    memcpy(d_int->cache, all_limbs + (count - chunk_size), 
+                           limbs_to_copy * sizeof(mp_limb_t));
+                    printf("DEBUG: Large number - copied most significant %zu limbs\n", limbs_to_copy);
+                } else {
+                    // Copy from the beginning (for smaller numbers)
+                    memcpy(d_int->cache, all_limbs, limbs_to_copy * sizeof(mp_limb_t));
                 }
+                
+                // Ensure we're writing non-zero data
+                printf("DEBUG: First few limbs: ");
+                for (size_t i = 0; i < 3 && i < chunk_size; i++) {
+                    printf("%016lx ", (unsigned long)((mp_limb_t*)d_int->cache)[i]);
+                }
+                printf("\n");
+            } else if (chunk_idx > 0 && chunk_idx < (count + d_int->chunk_size - 1) / d_int->chunk_size) {
+                // For subsequent chunks that are within the range of the significant limbs
+                memset(d_int->cache, 0, chunk_size * sizeof(mp_limb_t));
+                
+                size_t start_pos = chunk_idx * d_int->chunk_size;
+                if (start_pos < count) {
+                    size_t limbs_to_copy = (count - start_pos < chunk_size) ? 
+                                           (count - start_pos) : chunk_size;
+                    memcpy(d_int->cache, all_limbs + start_pos, limbs_to_copy * sizeof(mp_limb_t));
+                }
+            } else {
+                // Zero out any chunks beyond the significant limbs
+                memset(d_int->cache, 0, chunk_size * sizeof(mp_limb_t));
             }
             
             // Free the allocated memory
@@ -4478,6 +4498,35 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         mpz_init(final_Q);
         mpz_init(final_T);
         
+        // Verify combined state is still valid
+        printf("DEBUG: Verifying combined state objects are still valid\n");
+        printf("DEBUG: combined_state.P.file_path=%s\n", combined_state.P.file_path);
+        printf("DEBUG: combined_state.Q.file_path=%s\n", combined_state.Q.file_path);
+        printf("DEBUG: combined_state.T.file_path=%s\n", combined_state.T.file_path);
+        
+        // Check if any file paths got cleared accidentally
+        if (combined_state.P.file_path[0] == '\0') {
+            fprintf(stderr, "CRITICAL ERROR: combined_state.P.file_path is empty before final transfer!\n");
+            // Reinitialize it if needed
+            if (safe_path_join(combined_state.P.file_path, MAX_PATH, result_path, "P") >= 0) {
+                fprintf(stderr, "Attempting to recover P path: %s\n", combined_state.P.file_path);
+            }
+        }
+        if (combined_state.Q.file_path[0] == '\0') {
+            fprintf(stderr, "CRITICAL ERROR: combined_state.Q.file_path is empty before final transfer!\n");
+            // Reinitialize it if needed
+            if (safe_path_join(combined_state.Q.file_path, MAX_PATH, result_path, "Q") >= 0) {
+                fprintf(stderr, "Attempting to recover Q path: %s\n", combined_state.Q.file_path);
+            }
+        }
+        if (combined_state.T.file_path[0] == '\0') {
+            fprintf(stderr, "CRITICAL ERROR: combined_state.T.file_path is empty before final transfer!\n");
+            // Reinitialize it if needed
+            if (safe_path_join(combined_state.T.file_path, MAX_PATH, result_path, "T") >= 0) {
+                fprintf(stderr, "Attempting to recover T path: %s\n", combined_state.T.file_path);
+            }
+        }
+        
         // Get values from combined state
         disk_int_get_mpz(final_P, &combined_state.P);
         disk_int_get_mpz(final_Q, &combined_state.Q);
@@ -4490,7 +4539,26 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
             mpz_get_str(NULL, 10, final_T));
             
         // Transfer to the original state
-        // Note: We're not clearing the original state first to avoid mutex issues
+        // CRITICAL: We must NOT clear the original state before transfer
+        // Instead, make sure the disk_int_set_mpz function handles the update correctly
+        
+        printf("DEBUG: CRITICAL - Transferring combined_state to original state\n");
+        printf("DEBUG: Original state P path: %s\n", state->data.chudnovsky.P.file_path);
+        printf("DEBUG: Original state Q path: %s\n", state->data.chudnovsky.Q.file_path);
+        printf("DEBUG: Original state T path: %s\n", state->data.chudnovsky.T.file_path);
+        
+        // Before transfer, verify the original objects are properly initialized
+        if (state->data.chudnovsky.P.file_path[0] == '\0') {
+            fprintf(stderr, "ERROR: Original state P has empty file_path before transfer!\n");
+        }
+        if (state->data.chudnovsky.Q.file_path[0] == '\0') {
+            fprintf(stderr, "ERROR: Original state Q has empty file_path before transfer!\n");
+        }
+        if (state->data.chudnovsky.T.file_path[0] == '\0') {
+            fprintf(stderr, "ERROR: Original state T has empty file_path before transfer!\n");
+        }
+        
+        // Transfer to original state
         disk_int_set_mpz(&state->data.chudnovsky.P, final_P);
         disk_int_set_mpz(&state->data.chudnovsky.Q, final_Q);
         disk_int_set_mpz(&state->data.chudnovsky.T, final_T);
