@@ -436,6 +436,7 @@ Other limitations:
   - Eliminated memory leak in thread pool management
   - Improved resource cleanup across all operations
 - **Eliminated Race Conditions**: 
+  - Fixed race condition in disk_int_init with mutex protection for static variables
   - Addressed potential deadlocks in disk integer comparison operations
   - Implemented consistent lock acquisition ordering based on memory addresses
 - **Standardized Logging System**: 
@@ -449,6 +450,11 @@ Other limitations:
   - Legacy Systems: Improved manual implementation with comprehensive carry propagation
 - **Enhanced Chunked Arithmetic**: Refined out-of-core operations with precise carry/borrow handling across chunk boundaries
 - **Mathematical Correctness Assurance**: Comprehensive algorithm improvements for subtraction, addition, and multiplication operations
+- **Fixed Critical Issues in Large Integer Handling**:
+  - Corrected mpz_export processing in disk_int_set_mpz to properly handle numbers with large 2^k factors
+  - Fixed zero detection in disk_int_mul and disk_int_add to rely on limb count instead of sign field
+  - Enhanced file path integrity check before disk operations
+  - Added recovery mechanisms for file path corruption  
 - **Improved Code Documentation**: Enhanced comments explaining complex arithmetic operations for better maintainability
 - **Dynamic Overflow Protection**: Robust detection and handling of numerical overflows in all arithmetic operations
 - **Optimized Memory Usage**: Fine-tuned chunking strategies for better memory efficiency while maintaining performance

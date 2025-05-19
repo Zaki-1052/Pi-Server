@@ -4794,8 +4794,8 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     FILE* f = fopen(state->output_file, "w");
     if (f) {
         // First print a safe version using mpfr_fprintf (avoids segfault)
-        fprintf(f, "Pi approximation (safe format): ");
-        mpfr_fprintf(f, "%.50RNf\n\n", mpfr_pi);
+        // fprintf(f, "Pi approximation (safe format): ");
+        // mpfr_fprintf(f, "%.50RNf\n\n", mpfr_pi);
         
         // Now attempt to get full precision string representation
         printf("DEBUG: Preparing to call mpfr_get_str for %lu digits\n", state->digits);
@@ -4806,11 +4806,11 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         mpfr_exp_t exp = 0;
         
         // Safety: Limit digits to reasonable maximum if needed
-        unsigned long safe_digits = state->digits;
-        if (safe_digits > 100000) {
-            fprintf(stderr, "WARNING: Limiting digit output to 100000 for safety\n");
-            safe_digits = 100000;
-        }
+        // unsigned long safe_digits = state->digits;
+        // if (safe_digits > 100000) {
+        //     fprintf(stderr, "WARNING: Limiting digit output to 100000 for safety\n");
+        //     safe_digits = 100000;
+        // }
         
         // Only attempt mpfr_get_str if we have a valid number
         if (mpfr_number_p(mpfr_pi)) {
