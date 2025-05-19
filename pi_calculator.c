@@ -1022,28 +1022,61 @@ void disk_int_set_mpz(disk_int* d_int, mpz_t mpz_val) {
             }
         }
         
-        // Extract the chunk from mpz_t
-        // We'll check if first limb is non-zero when we're at the start
-        mp_limb_t first_limb = 0;
-        if (chunk_idx == 0) {
-            // Get the actual first limb (which might be at a higher index if total_size is inflated)
-            for (size_t i = 0; i < total_size; i++) {
-                mp_limb_t test_limb = mpz_getlimbn(mpz_val, i);
-                if (test_limb != 0) {
-                    first_limb = test_limb;
-                    break;
+        // Extract the chunk from mpz_t using mpz_export to get all limbs at once
+        // This guarantees we get the actual non-zero limbs instead of potentially all zeros
+        size_t count;
+        mp_limb_t *all_limbs = mpz_export(NULL, &count, -1, sizeof(mp_limb_t), 0, 0, mpz_val);
+        
+        if (!all_limbs) {
+            // If mpz_export returns NULL, the number is zero
+            memset(d_int->cache, 0, chunk_size * sizeof(mp_limb_t));
+            printf("DEBUG: mpz_export returned NULL - setting all limbs to zero\n");
+        } else {
+            // Verify we got the expected number of limbs
+            if (count != total_size) {
+                printf("DEBUG: mpz_export returned %zu limbs, but expected %zu\n", count, total_size);
+            }
+            
+            // If this is the first chunk and the exported size is smaller than total_size,
+            // it means there are leading zeros that mpz_export skipped
+            if (chunk_idx == 0 && count < total_size) {
+                // The difference is the number of leading zeros (at the most significant end)
+                size_t leading_zeros = total_size - count;
+                
+                // Fill the chunk with data from the correct position in all_limbs
+                for (size_t i = 0; i < chunk_size; i++) {
+                    if (i < leading_zeros) {
+                        // These are the skipped leading zeros
+                        ((mp_limb_t*)d_int->cache)[i] = 0;
+                    } else if (i - leading_zeros < count) {
+                        // These are the actual limbs from mpz_export
+                        ((mp_limb_t*)d_int->cache)[i] = all_limbs[i - leading_zeros];
+                    } else {
+                        // Beyond the size of the number
+                        ((mp_limb_t*)d_int->cache)[i] = 0;
+                    }
+                }
+            } else {
+                // For subsequent chunks, we copy from all_limbs starting at chunk_start
+                // but need to account for skipping leading zeros
+                size_t src_offset = (chunk_idx * d_int->chunk_size);
+                
+                // Clear the chunk first
+                memset(d_int->cache, 0, chunk_size * sizeof(mp_limb_t));
+                
+                // Ensure we stay within bounds
+                if (src_offset < count) {
+                    // Determine how many limbs to copy (minimum of chunk_size and remaining limbs)
+                    size_t limbs_to_copy = (count - src_offset < chunk_size) ? 
+                                           (count - src_offset) : chunk_size;
+                    
+                    // Copy the limbs
+                    memcpy(d_int->cache, all_limbs + src_offset, limbs_to_copy * sizeof(mp_limb_t));
                 }
             }
-        }
-        
-        for (size_t i = 0; i < chunk_size; i++) {
-            size_t limb_idx = chunk_start + i;
-            if (limb_idx < total_size) {
-                ((mp_limb_t*)d_int->cache)[i] = mpz_getlimbn(mpz_val, limb_idx);
-            } else {
-                // Should not happen, but just in case
-                ((mp_limb_t*)d_int->cache)[i] = 0;
-            }
+            
+            // Free the allocated memory
+            free(all_limbs);
         }
         
         // We no longer need the band-aid fix since we properly handle leading zeros in mpz_import
