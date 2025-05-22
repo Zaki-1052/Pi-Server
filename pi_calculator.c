@@ -63,6 +63,10 @@
 // Constants and Macros
 // ==========================================================================
 
+// UUID constants
+#define UUID_NUM_BYTES 16                  // Number of random bytes for a UUID
+#define UUID_STR_LEN 37                    // UUID string length (36 chars + null terminator)
+
 // Buffer sizes and limits
 #define BUFFER_SIZE 4096                   // General purpose buffer size
 #define MAX_PATH 4096                      // Maximum path length
@@ -153,7 +157,7 @@ typedef enum {
 
 // Calculation job structure forward declaration
 typedef struct calculation_job {
-    char job_id[37];                     // UUID for the job (36 chars + null)
+    char job_id[UUID_STR_LEN];           // UUID for the job
     algorithm_t algorithm;               // Algorithm to use
     unsigned long digits;                // Number of digits requested
     out_of_core_mode_t out_of_core_mode; // Out-of-core mode
@@ -350,7 +354,13 @@ void perform_crash_logging(const char *crash_log_path) {
                        "gdb -ex 'set pagination 0' -ex 'thread apply all bt' -ex 'quit' -p $$ 2>/dev/null || "
                        "echo 'Backtrace utilities not available'");
     if (sys_result == -1) {
-        fprintf(stderr, "Failed to execute backtrace command\n");
+        fprintf(stderr, "Failed to execute backtrace command: %s\n", strerror(errno));
+        if (crash_log) fprintf(crash_log, "Failed to execute backtrace command: %s\n", strerror(errno));
+    } else if (WIFEXITED(sys_result) && WEXITSTATUS(sys_result) != 0) {
+        // This command pipeline returns non-zero if backtrace or gdb are not found, 
+        // or if they fail. This is not necessarily a critical error for the logger itself.
+        fprintf(stderr, "Backtrace command pipeline exited with status %d\n", WEXITSTATUS(sys_result));
+        if (crash_log) fprintf(crash_log, "Backtrace command pipeline exited with status %d\n", WEXITSTATUS(sys_result));
     }
 #endif
 
@@ -364,14 +374,22 @@ void perform_crash_logging(const char *crash_log_path) {
 #ifdef __APPLE__
     sys_result = system("ps -o pid,vsz,rss,command -p $$ 2>/dev/null >> pi_calculator_crash.log || echo 'Memory info not available'");
     if (sys_result == -1) {
-        fprintf(stderr, "Failed to execute memory info command\n");
+        fprintf(stderr, "Failed to execute memory info command (Apple): %s\n", strerror(errno));
+        if (crash_log) fprintf(crash_log, "Failed to execute memory info command (Apple): %s\n", strerror(errno));
+    } else if (WIFEXITED(sys_result) && WEXITSTATUS(sys_result) != 0) {
+        fprintf(stderr, "Memory info command (Apple) exited with status %d\n", WEXITSTATUS(sys_result));
+        if (crash_log) fprintf(crash_log, "Memory info command (Apple) exited with status %d\n", WEXITSTATUS(sys_result));
     }
 #else
     sys_result = system("cat /proc/self/status 2>/dev/null | grep -i 'VmSize\\|VmRSS' >> pi_calculator_crash.log || "
                       "ps -o pid,vsz,rss,cmd -p $$ 2>/dev/null >> pi_calculator_crash.log || "
                       "echo 'Memory info not available'");
     if (sys_result == -1) {
-        fprintf(stderr, "Failed to execute memory info command\n");
+        fprintf(stderr, "Failed to execute memory info command (Linux): %s\n", strerror(errno));
+        if (crash_log) fprintf(crash_log, "Failed to execute memory info command (Linux): %s\n", strerror(errno));
+    } else if (WIFEXITED(sys_result) && WEXITSTATUS(sys_result) != 0) {
+        fprintf(stderr, "Memory info command (Linux) exited with status %d\n", WEXITSTATUS(sys_result));
+        if (crash_log) fprintf(crash_log, "Memory info command (Linux) exited with status %d\n", WEXITSTATUS(sys_result));
     }
 #endif
     
@@ -422,8 +440,8 @@ void perform_crash_logging(const char *crash_log_path) {
                                 config.work_dir, filename);
                     } else {
                         // If it would exceed the buffer, use just the filename in current directory
-                        strncpy(checkpoint_path, filename, MAX_PATH-1);
-                        checkpoint_path[MAX_PATH-1] = '\0';
+                        log_message("warning", "Checkpoint path too long in perform_crash_logging, using filename only for job %s", jobs[i].job_id);
+                        snprintf(checkpoint_path, MAX_PATH, "%s", filename);
                     }
                     
                     FILE *checkpoint = fopen(checkpoint_path, "w");
@@ -438,13 +456,22 @@ void perform_crash_logging(const char *crash_log_path) {
                         fprintf(checkpoint, "  \"crash_time\": %ld,\n", (long)now);
                         fprintf(checkpoint, "  \"error\": \"Calculation terminated by segmentation fault\"\n");
                         fprintf(checkpoint, "}\n");
-                        fclose(checkpoint);
+                        if (fclose(checkpoint) != 0) {
+                            fprintf(stderr, "Error closing crash checkpoint file %s: %s\n", checkpoint_path, strerror(errno));
+                            if (crash_log) fprintf(crash_log, "Error closing crash checkpoint file %s: %s\n", checkpoint_path, strerror(errno));
+                        }
                         
                         fprintf(stderr, "  Saved crash checkpoint for job %s to %s\n", 
                                 jobs[i].job_id, checkpoint_path);
                         if (crash_log) {
                             fprintf(crash_log, "  Saved crash checkpoint for job %s to %s\n", 
                                     jobs[i].job_id, checkpoint_path);
+                        }
+                    } else {
+                        // Failed to open checkpoint file
+                        fprintf(stderr, "Error: Failed to open crash checkpoint file %s: %s\n", checkpoint_path, strerror(errno));
+                        if (crash_log) {
+                            fprintf(crash_log, "Error: Failed to open crash checkpoint file %s: %s\n", checkpoint_path, strerror(errno));
                         }
                     }
                 } // Close the else block
@@ -480,7 +507,10 @@ void perform_crash_logging(const char *crash_log_path) {
     // Close crash log if open
     if (crash_log) {
         fprintf(crash_log, "\nEnd of crash log\n");
-        fclose(crash_log);
+        if (fclose(crash_log) != 0) {
+            // Not much to do if the main crash log itself fails to close, but log to stderr.
+            fprintf(stderr, "Error closing main crash_log file %s: %s\n", crash_log_path, strerror(errno));
+        }
         fprintf(stderr, "Crash information saved to %s\n", crash_log_path);
     }
 }
@@ -759,10 +789,14 @@ int save_chunk(disk_int* d_int, size_t chunk_idx) {
     }
     
     // Flush and close file
-    fflush(f);
+    if (fflush(f) != 0) {
+        log_message("error", "fflush failed for chunk file %s in save_chunk: %s", chunk_path, strerror(errno));
+        // Attempt to close anyway, but record error
+        fclose(f); // Best effort close
+        return -1;
+    }
     if (fclose(f) != 0) {
-        fprintf(stderr, "Error closing chunk file: %s (errno: %d - %s)\n",
-                chunk_path, errno, strerror(errno));
+        log_message("error", "fclose failed for chunk file %s in save_chunk: %s", chunk_path, strerror(errno));
         return -1;
     }
     
@@ -3194,7 +3228,9 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
             snprintf(cleanup_cmd, sizeof(cleanup_cmd), "rm -f %s/*", temp2_path);
             int sys_result = system(cleanup_cmd);
             if (sys_result == -1) {
-                fprintf(stderr, "Warning: Failed to execute cleanup command for temp2 directory\n");
+                log_message("warning", "system call to clean temp2_path failed for %s: %s", temp2_path, strerror(errno));
+            } else if (WIFEXITED(sys_result) && WEXITSTATUS(sys_result) != 0) {
+                log_message("warning", "system call to clean temp2_path for %s exited with status %d", temp2_path, WEXITSTATUS(sys_result));
             }
             
             // Now try to remove the directory
@@ -3242,7 +3278,9 @@ void binary_split_disk(chudnovsky_state* result, unsigned long a, unsigned long 
             snprintf(cleanup_cmd, sizeof(cleanup_cmd), "rm -f %s/*", left_path);
             int sys_result = system(cleanup_cmd);
             if (sys_result == -1) {
-                fprintf(stderr, "Warning: Failed to execute cleanup command for left directory\n");
+                log_message("warning", "system call to clean temp1_path failed for %s: %s", temp1_path, strerror(errno));
+            } else if (WIFEXITED(sys_result) && WEXITSTATUS(sys_result) != 0) {
+                log_message("warning", "system call to clean temp1_path for %s exited with status %d", temp1_path, WEXITSTATUS(sys_result));
             }
             
             // Now try to remove the directory
@@ -3498,7 +3536,27 @@ void* calc_thread_worker(void* arg) {
 // Start calculation thread pool
 void calc_thread_pool_start(calc_thread_pool* pool) {
     for (int i = 0; i < pool->num_threads; i++) {
-        pthread_create(&pool->threads[i], NULL, calc_thread_worker, pool);
+        if (pthread_create(&pool->threads[i], NULL, calc_thread_worker, pool) != 0) {
+            log_message("critical", "pthread_create failed in calc_thread_pool_start: %s", strerror(errno));
+            // Partial initialization: try to clean up
+            for (int j = 0; j < i; j++) {
+                // Attempt to cancel and join threads that were successfully created
+                // Note: Cancellation is cooperative. These threads might not terminate immediately
+                // or cleanly, especially if they are in uninterruptible operations.
+                pthread_cancel(pool->threads[j]);
+                pthread_join(pool->threads[j], NULL);
+            }
+            // The main resources (queue, mutexes, cond vars) are initialized in calc_thread_pool_init.
+            // If threads failed to create, the pool is not fully functional.
+            // Freeing pool->threads here makes sense.
+            if (pool->threads) {
+                 free(pool->threads);
+                 pool->threads = NULL; // Mark as failed to prevent double free if shutdown is called
+            }
+            // This is a critical failure for the calculation pool's operation.
+            // Depending on program design, could propagate error or exit. Exiting for robustness.
+            exit(EXIT_FAILURE);
+        }
     }
 }
 
@@ -3514,7 +3572,8 @@ calc_task* calc_thread_pool_submit_binary_split(calc_thread_pool* pool,
     params->a = a;
     params->b = b;
     params->result = result;
-    strncpy(params->base_path, base_path, MAX_PATH);
+    // Ensure null termination and prevent overflow if base_path is too long
+    snprintf(params->base_path, MAX_PATH, "%s", base_path);
     params->memory_threshold = memory_threshold;
     
     t->type = TASK_BINARY_SPLIT;
@@ -3760,7 +3819,20 @@ void http_thread_pool_init(http_thread_pool* pool, int num_threads) {
     }
     
     for (int i = 0; i < num_threads; i++) {
-        pthread_create(&pool->threads[i], NULL, http_worker_function, pool);
+        if (pthread_create(&pool->threads[i], NULL, http_worker_function, pool) != 0) {
+            log_message("critical", "pthread_create failed in http_thread_pool_init: %s", strerror(errno));
+            // Partial initialization: try to clean up what was done
+            for (int j = 0; j < i; j++) {
+                pthread_cancel(pool->threads[j]); // Request cancel for already created threads
+                pthread_join(pool->threads[j], NULL); // Wait for them to exit
+            }
+            sem_close(pool->job_semaphore);
+            sem_unlink(pool->sem_name);
+            free(pool->threads);
+            pool->threads = NULL; // Mark as failed
+            // This is a critical failure for server setup.
+            exit(EXIT_FAILURE); 
+        }
     }
 }
 
@@ -3821,7 +3893,11 @@ void initialize_jobs() {
     if (!jobs_initialized) {
         for (int i = 0; i < MAX_JOBS; i++) {
             jobs[i].job_id[0] = '\0';  // Empty job ID indicates unused slot
-            pthread_mutex_init(&jobs[i].lock, NULL);
+            if (pthread_mutex_init(&jobs[i].lock, NULL) != 0) {
+                log_message("critical", "pthread_mutex_init failed for jobs[%d].lock in initialize_jobs: %s. Exiting.", i, strerror(errno));
+                // This is a critical failure for job management.
+                exit(EXIT_FAILURE);
+            }
         }
         jobs_initialized = true;
     }
@@ -3833,25 +3909,29 @@ void initialize_jobs() {
 void generate_uuid(char* uuid, size_t size) {
     static const char hex_chars[] = "0123456789abcdef";
     
-    if (size < 37) return;  // Need at least 36 chars + null
+    if (size < UUID_STR_LEN) return;
     
     // Format: 8-4-4-4-12 (8 chars, dash, 4 chars, dash, etc.)
-    unsigned char random_bytes[16];
+    unsigned char random_bytes[UUID_NUM_BYTES];
     
     // Get random bytes
     FILE* urandom = fopen("/dev/urandom", "rb");
     if (urandom) {
-        size_t bytes_read = fread(random_bytes, 1, 16, urandom);
-        if (bytes_read != 16) {
+        size_t bytes_read = fread(random_bytes, 1, UUID_NUM_BYTES, urandom);
+        if (bytes_read != UUID_NUM_BYTES) {
             // Fall back to time-based if read fails
             time_t now = time(NULL);
             unsigned int seed = (unsigned int)now;
-            for (int i = 0; i < 16; i++) {
+            for (int i = 0; i < UUID_NUM_BYTES; i++) { // Use UUID_NUM_BYTES
                 random_bytes[i] = (unsigned char)(rand_r(&seed) % 256);
             }
         }
-        fclose(urandom);
+        if (fclose(urandom) != 0) {
+            log_message("warning", "fclose failed for /dev/urandom in generate_uuid: %s", strerror(errno));
+            // Continue, as we might have gotten enough random bytes or will use fallback
+        }
     } else {
+        log_message("warning", "fopen failed for /dev/urandom in generate_uuid: %s. Using fallback.", strerror(errno));
         // Fallback to time-based if /dev/urandom not available
         time_t now = time(NULL);
         unsigned int seed = (unsigned int)now;
@@ -3862,8 +3942,8 @@ void generate_uuid(char* uuid, size_t size) {
     
     // Format the UUID
     int pos = 0;
-    for (int i = 0; i < 16; i++) {
-        // Add dashes at positions 8, 13, 18, 23
+    for (int i = 0; i < UUID_NUM_BYTES; i++) { // Use UUID_NUM_BYTES
+        // Add dashes at positions 8, 13, 18, 23 (corresponding to byte indices 4, 6, 8, 10)
         if (i == 4 || i == 6 || i == 8 || i == 10) {
             uuid[pos++] = '-';
         }
@@ -3920,7 +4000,10 @@ int find_or_create_job(const char* job_id) {
         
         // Clean up the old job
         if (jobs[oldest_completed_idx].result_file[0] != '\0') {
-            unlink(jobs[oldest_completed_idx].result_file);
+            if (unlink(jobs[oldest_completed_idx].result_file) != 0) {
+                log_message("warning", "unlink failed for old job result file %s in find_or_create_job: %s", 
+                            jobs[oldest_completed_idx].result_file, strerror(errno));
+            }
         }
         
         // Reinitialize the job
@@ -3956,8 +4039,9 @@ void update_job_status(int job_idx, job_status_t status, double progress, const 
     }
     
     if (error_message) {
-        strncpy(jobs[job_idx].error_message, error_message, sizeof(jobs[job_idx].error_message) - 1);
-        jobs[job_idx].error_message[sizeof(jobs[job_idx].error_message) - 1] = '\0';
+        snprintf(jobs[job_idx].error_message, sizeof(jobs[job_idx].error_message), "%s", error_message);
+        // sizeof(jobs[job_idx].error_message) ensures snprintf does not write past the buffer
+        // and null-terminates it.
     }
     
     pthread_mutex_unlock(&jobs[job_idx].lock);
@@ -4009,7 +4093,8 @@ void calculation_state_init(calculation_state* state, unsigned long digits, algo
     state->start_time = time(NULL);
     state->last_checkpoint = state->start_time;
     
-    strncpy(state->work_dir, work_dir, MAX_PATH);
+    // Ensure null termination by using snprintf
+    snprintf(state->work_dir, MAX_PATH, "%s", work_dir);
     
     // Create work directory if it doesn't exist
     mkdir_recursive(state->work_dir, 0755);
@@ -4309,9 +4394,13 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
                 }
                 mpfr_free_str(str_pi);
             } else {
-                fprintf(f, "ERROR: Pi calculation failed");
+                fprintf(f, "ERROR: Pi calculation failed (mpfr_get_str returned NULL)");
             }
-            fclose(f);
+            if (fclose(f) != 0) {
+                log_message("error", "fclose failed for output file %s in calculate_pi_gauss_legendre: %s", state->output_file, strerror(errno));
+            }
+        } else {
+            log_message("error", "fopen failed for output file %s in calculate_pi_gauss_legendre: %s", state->output_file, strerror(errno));
         }
         
         // Clean up variables
@@ -4346,7 +4435,9 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
     snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf %s", split_path);
     int sys_result = system(rm_cmd);
     if (sys_result == -1) {
-        fprintf(stderr, "Warning: Failed to execute directory cleanup command\n");
+        log_message("warning", "system(rm -rf split_path) failed in calculate_pi_chudnovsky for %s: %s", split_path, strerror(errno));
+    } else if (WIFEXITED(sys_result) && WEXITSTATUS(sys_result) != 0) {
+        log_message("warning", "system(rm -rf split_path) for %s exited with status %d", split_path, WEXITSTATUS(sys_result));
     }
     
     // Now create fresh split directory
@@ -4424,8 +4515,19 @@ void calculate_pi_chudnovsky(calculation_state* state, calc_thread_pool* pool) {
         
         // Create task for each chunk
         calc_task** tasks = (calc_task**)malloc(pool->num_threads * sizeof(calc_task*));
+        if (tasks == NULL) {
+            log_message("critical", "malloc failed for tasks array in calculate_pi_chudnovsky: %s", strerror(errno));
+            update_job_status(state->job_idx, JOB_STATUS_FAILED, state->current_term / (double)state->terms, "malloc failure for tasks array");
+            return;
+        }
         chudnovsky_state* chunk_results = (chudnovsky_state*)malloc(
                                           pool->num_threads * sizeof(chudnovsky_state));
+        if (chunk_results == NULL) {
+            log_message("critical", "malloc failed for chunk_results array in calculate_pi_chudnovsky: %s", strerror(errno));
+            free(tasks); // tasks was allocated
+            update_job_status(state->job_idx, JOB_STATUS_FAILED, state->current_term / (double)state->terms, "malloc failure for chunk_results array");
+            return;
+        }
         
         for (int i = 0; i < pool->num_threads; i++) {
             unsigned long start = i * chunk_size;
@@ -5696,7 +5798,9 @@ void parse_query_string(const char* query, char* algo, size_t algo_size,
     
     // Split the query string by '&'
     char query_copy[BUFFER_SIZE];
-    strncpy(query_copy, query, BUFFER_SIZE);
+    snprintf(query_copy, sizeof(query_copy), "%s", query); 
+    // query_copy[sizeof(query_copy) - 1] = '\0'; // Ensure null termination, snprintf handles this if space permits.
+                                               // If query is >= sizeof(query_copy), it will be truncated.
     
     char* token = strtok(query_copy, "&");
     while (token) {
@@ -5710,9 +5814,9 @@ void parse_query_string(const char* query, char* algo, size_t algo_size,
             
             // Check for known parameters
             if (strcmp(key, "algo") == 0) {
-                strncpy(algo, value, algo_size);
+                snprintf(algo, algo_size, "%s", value);
             } else if (strcmp(key, "digits") == 0) {
-                strncpy(digits_str, value, digits_size);
+                snprintf(digits_str, digits_size, "%s", value);
             } else if (strcmp(key, "out_of_core") == 0) {
                 if (strcmp(value, "true") == 0) {
                     *out_of_core_mode = OOC_FORCE;
@@ -5803,15 +5907,15 @@ void* calculation_thread_func(void* arg) {
     unsigned long digits;
     out_of_core_mode_t out_of_core_mode;
     bool checkpointing_enabled;
-    char job_id[37]; // UUID is 36 chars + null
+    char job_id[UUID_STR_LEN]; 
     
     pthread_mutex_lock(&jobs[job_idx].lock);
     algorithm = jobs[job_idx].algorithm;
     digits = jobs[job_idx].digits;
     out_of_core_mode = jobs[job_idx].out_of_core_mode;
     checkpointing_enabled = jobs[job_idx].checkpointing_enabled;
-    strncpy(job_id, jobs[job_idx].job_id, sizeof(job_id));
-    job_id[sizeof(job_id) - 1] = '\0'; // Ensure null termination
+    // Use snprintf for safer string copy and guaranteed null termination
+    snprintf(job_id, sizeof(job_id), "%s", jobs[job_idx].job_id);
     pthread_mutex_unlock(&jobs[job_idx].lock);
     
     // Determine if out of core should be used
@@ -6563,9 +6667,11 @@ void* handle_http_request(void* arg) {
     buffer[bytes_read] = '\0';
     
     // Parse request method and path
-    char method[10] = {0};
+    char method[10] = {0}; // Max 9 chars for method + null
     char path[BUFFER_SIZE] = {0};
-    sscanf(buffer, "%9s %[^ ] HTTP", method, path);
+    // Use width specifier for path to prevent overflow. BUFFER_SIZE is 4096.
+    // %4095[^ ] ensures at most 4095 chars are read into path, leaving space for null.
+    sscanf(buffer, "%9s %4095[^ ] HTTP", method, path); 
     
     // Check if this is a valid GET request
     if (strcmp(method, "GET") != 0) {
@@ -6823,7 +6929,12 @@ void handle_sigint(int sig) {
              config.work_dir);
     int sys_result = system(cleanup_cmd);
     if (sys_result == -1) {
-        fprintf(stderr, "Warning: Failed to execute final cleanup command\n");
+        log_message("warning", "system call for final cleanup failed: %s", strerror(errno));
+    } else if (WIFEXITED(sys_result) && WEXITSTATUS(sys_result) != 0) {
+        // The command uses "|| true", so it should ideally not return a non-zero exit status
+        // unless 'true' itself fails, which is highly unlikely.
+        // However, if the find command has issues before "|| true", it might still log to its stderr.
+        log_message("warning", "system call for final cleanup exited with status %d", WEXITSTATUS(sys_result));
     }
     
     // Flush and close log file
