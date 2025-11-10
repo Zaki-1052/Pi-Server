@@ -122,7 +122,8 @@ void calculation_state_init(calculation_state* state, unsigned long digits, algo
     // Update job info if async
     if (job_idx >= 0) {
         pthread_mutex_lock(&jobs[job_idx].lock);
-        strncpy(jobs[job_idx].result_file, state->output_file, MAX_PATH);
+        strncpy(jobs[job_idx].result_file, state->output_file, MAX_PATH - 1);
+        jobs[job_idx].result_file[MAX_PATH - 1] = '\0';  // Ensure null termination
         pthread_mutex_unlock(&jobs[job_idx].lock);
     }
 }

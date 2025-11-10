@@ -16,7 +16,8 @@ volatile bool g_shutdown_flag = false;
 // Set default configuration values
 void set_default_config(void) {
     // Server settings
-    strncpy(config.ip_address, "127.0.0.1", INET_ADDRSTRLEN);
+    strncpy(config.ip_address, "127.0.0.1", INET_ADDRSTRLEN - 1);
+    config.ip_address[INET_ADDRSTRLEN - 1] = '\0';  // Ensure null termination
     config.port = 8080;
     config.max_http_threads = 16;
     config.max_calc_threads = 4;
@@ -30,11 +31,13 @@ void set_default_config(void) {
 
     // Logging settings
     config.log_level = LOG_LEVEL_INFO;
-    strncpy(config.logging_output, "console", sizeof(config.logging_output));
+    strncpy(config.logging_output, "console", sizeof(config.logging_output) - 1);
+    config.logging_output[sizeof(config.logging_output) - 1] = '\0';  // Ensure null termination
     config.logging.level = LOG_LEVEL_INFO;
 
     // Directory settings
-    strncpy(config.work_dir, "./pi_calc", sizeof(config.work_dir));
+    strncpy(config.work_dir, "./pi_calc", sizeof(config.work_dir) - 1);
+    config.work_dir[sizeof(config.work_dir) - 1] = '\0';  // Ensure null termination
     config.checkpointing_enabled = true;
     config.checkpoint_interval = 600;  // 10 minutes
 
@@ -72,7 +75,10 @@ bool load_config_from_file(const char* config_file) {
     struct json_object *j_ip, *j_port, *j_max_http_threads, *j_max_calc_threads;
     if (json_object_object_get_ex(parsed_json, "ip_address", &j_ip)) {
         const char* ip = json_object_get_string(j_ip);
-        if (ip) strncpy(config.ip_address, ip, INET_ADDRSTRLEN);
+        if (ip) {
+            strncpy(config.ip_address, ip, INET_ADDRSTRLEN - 1);
+            config.ip_address[INET_ADDRSTRLEN - 1] = '\0';  // Ensure null termination
+        }
     }
 
     if (json_object_object_get_ex(parsed_json, "port", &j_port)) {
@@ -132,7 +138,10 @@ bool load_config_from_file(const char* config_file) {
 
         if (json_object_object_get_ex(j_logging, "output", &j_output)) {
             const char* output = json_object_get_string(j_output);
-            if (output) strncpy(config.logging_output, output, sizeof(config.logging_output));
+            if (output) {
+                strncpy(config.logging_output, output, sizeof(config.logging_output) - 1);
+                config.logging_output[sizeof(config.logging_output) - 1] = '\0';  // Ensure null termination
+            }
         }
     }
 
@@ -141,7 +150,10 @@ bool load_config_from_file(const char* config_file) {
 
     if (json_object_object_get_ex(parsed_json, "work_dir", &j_work_dir)) {
         const char* dir = json_object_get_string(j_work_dir);
-        if (dir) strncpy(config.work_dir, dir, sizeof(config.work_dir));
+        if (dir) {
+            strncpy(config.work_dir, dir, sizeof(config.work_dir) - 1);
+            config.work_dir[sizeof(config.work_dir) - 1] = '\0';  // Ensure null termination
+        }
     }
 
     if (json_object_object_get_ex(parsed_json, "checkpointing_enabled", &j_checkpointing)) {
@@ -178,13 +190,15 @@ void override_config_with_args(int argc, char** argv) {
                 config.memory_limit = (size_t)atol(optarg) * 1024 * 1024 * 1024;
                 break;
             case 'w':  // Work directory
-                strncpy(config.work_dir, optarg, sizeof(config.work_dir));
+                strncpy(config.work_dir, optarg, sizeof(config.work_dir) - 1);
+                config.work_dir[sizeof(config.work_dir) - 1] = '\0';  // Ensure null termination
                 break;
             case 'p':  // Port
                 config.port = atoi(optarg);
                 break;
             case 'i':  // IP address
-                strncpy(config.ip_address, optarg, INET_ADDRSTRLEN);
+                strncpy(config.ip_address, optarg, INET_ADDRSTRLEN - 1);
+                config.ip_address[INET_ADDRSTRLEN - 1] = '\0';  // Ensure null termination
                 break;
             case 'c':  // Config file
                 // This is handled elsewhere

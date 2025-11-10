@@ -466,8 +466,9 @@ void disk_int_clear(disk_int* d_int) {
     
     // Save the file path and number of chunks for cleanup after lock release
     char file_path_copy[MAX_PATH];
-    strncpy(file_path_copy, d_int->file_path, MAX_PATH);
-    
+    strncpy(file_path_copy, d_int->file_path, MAX_PATH - 1);
+    file_path_copy[MAX_PATH - 1] = '\0';  // Ensure null termination
+
     // Store the actual number of chunks before clearing
     size_t num_chunks = d_int->num_chunks;
     
@@ -1030,14 +1031,16 @@ void disk_int_sub_abs(disk_int* result, disk_int* a, disk_int* b) {
     // Clear result first - make sure we're starting fresh
     // but keep the file path
     char file_path[MAX_PATH];
-    strncpy(file_path, result->file_path, MAX_PATH);
-    
+    strncpy(file_path, result->file_path, MAX_PATH - 1);
+    file_path[MAX_PATH - 1] = '\0';  // Ensure null termination
+
     disk_int_clear(result);
-    strncpy(result->file_path, file_path, MAX_PATH);
-    
+    strncpy(result->file_path, file_path, MAX_PATH - 1);
+    result->file_path[MAX_PATH - 1] = '\0';  // Ensure null termination
+
     // Create directory for result if it doesn't exist
     mkdir_recursive(result->file_path, 0755);
-    
+
     // Initialize result with the same structure as a
     result->chunk_size = a->chunk_size;
     result->total_size_in_limbs = a->total_size_in_limbs; // Initial estimate, will adjust at the end
@@ -1787,15 +1790,17 @@ void disk_int_mul(disk_int* result, disk_int* a, disk_int* b) {
     
     // True chunked multiplication algorithm
     printf("DEBUG: Using chunked multiplication algorithm\n");
-    
+
     // Clear result first - make sure we're starting fresh
     // but keep the file path
     char file_path[MAX_PATH];
-    strncpy(file_path, result->file_path, MAX_PATH);
-    
+    strncpy(file_path, result->file_path, MAX_PATH - 1);
+    file_path[MAX_PATH - 1] = '\0';  // Ensure null termination
+
     disk_int_clear(result);
-    strncpy(result->file_path, file_path, MAX_PATH);
-    
+    strncpy(result->file_path, file_path, MAX_PATH - 1);
+    result->file_path[MAX_PATH - 1] = '\0';  // Ensure null termination
+
     // Create directory for result if it doesn't exist
     mkdir_recursive(result->file_path, 0755);
     
