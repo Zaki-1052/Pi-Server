@@ -235,7 +235,7 @@ extern calc_thread_pool* g_calc_pool;
 extern int g_server_sock;
 
 // Shutdown and crash flags
-extern volatile bool g_shutdown_flag;
+extern volatile sig_atomic_t g_shutdown_flag;
 extern volatile sig_atomic_t g_segfault_occurred;
 extern char g_crash_log_path[MAX_PATH];
 
