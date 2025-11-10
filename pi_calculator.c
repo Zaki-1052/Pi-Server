@@ -38,7 +38,7 @@ calc_thread_pool* g_calc_pool = NULL;
 int g_server_sock = -1;
 
 // Shutdown and crash flags
-volatile bool g_shutdown_flag = false;
+volatile sig_atomic_t g_shutdown_flag = 0;
 volatile sig_atomic_t g_segfault_occurred = 0;
 char g_crash_log_path[MAX_PATH] = {0};
 
@@ -130,46 +130,52 @@ void run_server_mode() {
             // Consider more cleanup or just exit
             _exit(2); // Different exit code for crash
         }
+
+        // Check if SIGHUP was received and handle config reload
+        if (sighup_received) {
+            handle_sighup_reload();
+        }
+
         // Wait for connections with timeout to check shutdown flag periodically
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(g_server_sock, &read_fds);
-        
+
         struct timeval timeout;
         timeout.tv_sec = 1;  // 1 second timeout
         timeout.tv_usec = 0;
-        
+
         int activity = select(g_server_sock + 1, &read_fds, NULL, NULL, &timeout);
-        
+
         if (activity < 0 && errno != EINTR) {
             log_message("error", "Select error");
             break;
         }
-        
+
         if (activity > 0 && FD_ISSET(g_server_sock, &read_fds)) {
             // Accept new connection
             struct sockaddr_in client_addr;
             socklen_t addr_len = sizeof(client_addr);
             int client_sock = accept(g_server_sock, (struct sockaddr*)&client_addr, &addr_len);
-            
+
             if (client_sock < 0) {
                 log_message("error", "Failed to accept connection");
                 continue;
             }
-            
+
             // Add job to HTTP queue
             // http_enqueue_job now handles its own locking
             int enqueued = 1; // Assume success
-            
+
             // Enqueue the job
             http_enqueue_job(client_sock);
-            
+
             // Check if the client socket was enqueued successfully
             // (http_enqueue_job will log errors if the queue is full)
             if (enqueued) {
                 // Signal a worker thread that there's a new job
                 sem_post(http_pool.job_semaphore);
-                
+
                 if (config.log_level <= LOG_LEVEL_DEBUG) {
                     char client_ip[INET_ADDRSTRLEN];
                     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
@@ -186,26 +192,20 @@ void run_server_mode() {
             }
         }
     }
-    
-    // Clean up (this should be handled by the signal handler)
+
+    // Shutdown flag was set - perform graceful cleanup in main thread
+    // This is now safe because we're in the main thread, not a signal handler
+    perform_graceful_shutdown();
+
+    // Clean up remaining resources
     http_thread_pool_shutdown(&http_pool);
-    // Clean up the global calculation thread pool
-    if (g_calc_pool) {
-        calc_thread_pool_shutdown(g_calc_pool);
-        free(g_calc_pool);
-        g_calc_pool = NULL;
-    }
-    
     g_http_pool = NULL;
-    // g_calc_pool is already set to NULL above
-    
-    // Close server socket
+
+    // Close server socket if still open
     if (g_server_sock != -1) {
         close(g_server_sock);
         g_server_sock = -1;
     }
-    
-    close_log_file();
 }
 
 // ==========================================================================
